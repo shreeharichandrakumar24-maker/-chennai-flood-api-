@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Model artifacts (large binary files)
+*.pt
+*.joblib
+
+# Environment variables / secrets
+.env
+.env.*
+
+# SQLite database
+*.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Cloudflared binary (large, not needed for deployment)
+cloudflared.exe
+cloudflared
+
+# Flutter build artifacts
+flood_mobile/build/
+flood_mobile/.dart_tool/
+flood_mobile/android/build/
+flood_mobile/android/app/build/
+flood_mobile/linux/flutter/ephemeral/
+flood_mobile/macos/Flutter/ephemeral/
+flood_mobile/windows/flutter/ephemeral/
+
+# Stray files
+=2.27
+*.lock
+!flood_mobile/pubspec.lock

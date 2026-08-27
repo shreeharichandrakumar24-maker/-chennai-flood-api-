@@ -1,0 +1,46 @@
+name: chennai_flood_app
+description: Chennai Disaster Management App — AI-powered flood prediction and monitoring for citizens.
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.2.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # HTTP & API
+  http: ^1.2.0
+
+  # Maps
+  flutter_map: ^7.0.0
+  latlong2: ^0.9.1
+
+  # Charts
+  fl_chart: ^0.69.0
+
+  # Location
+  geolocator: ^13.0.1
+
+  # Local storage
+  shared_preferences: ^2.3.0
+
+  # UI
+  google_fonts: ^6.2.1
+  shimmer: ^3.0.0
+  lottie: ^3.1.0
+
+  # Icons
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/images/

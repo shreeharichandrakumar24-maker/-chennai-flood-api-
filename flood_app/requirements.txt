@@ -1,0 +1,9 @@
+pandas>=1.5
+numpy
+scikit-learn
+streamlit
+matplotlib
+joblib
+torch>=2.0
+pydeck>=0.8
+requests>=2.27
