@@ -10,7 +10,7 @@ import 'package:http/http.dart' as http;
 /// Both modes work through the Settings screen.
 class ApiConfig {
   static const String _storageKey = 'api_base_url';
-  static const String _defaultUrl = 'http://192.168.1.7:8000';
+  static const String _defaultUrl = 'https://chennai-flood-api.onrender.com';
   static String? _baseUrl;
 
   /// Get the current base URL (loads from storage on first access)

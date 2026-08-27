@@ -239,8 +239,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         ),
                         const SizedBox(height: 8),
                         const Text(
-                          'Fixed URL via DuckDNS. Works from mobile data,\n'
-                          'different WiFi, or anywhere in the world.',
+                          'Cloud-hosted on Render.com. Works from mobile data,\n'
+                          'different WiFi, or anywhere in the world.\n'
+                          '⚠️ First request may take ~30s (free tier cold start).',
                           style: TextStyle(fontSize: 13),
                         ),
                         const SizedBox(height: 8),
@@ -253,9 +254,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             border: Border.all(color: Colors.purple.shade200),
                           ),
                           child: const Text(
-                            'On PC run:  python main.py --duckdns\n'
-                            'Fixed URL: http://chennai-flood.duckdns.org:8000\n'
-                            'Requires port forwarding on your router.',
+                            'Cloud URL: https://chennai-flood-api.onrender.com\n'
+                            'Auto-connected if default URL is set.',
                             style: TextStyle(
                               fontFamily: 'monospace',
                               fontSize: 12,
