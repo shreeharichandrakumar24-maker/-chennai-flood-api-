@@ -250,6 +250,9 @@ class Complaint {
   final String status;
   final String? createdAt;
   final String? updatedAt;
+  /// Firebase Storage download URL (photo hosted in Firebase, all other
+  /// report data on the Render backend). Null when no photo was attached.
+  final String? photoUrl;
 
   Complaint({
     this.id,
@@ -263,21 +266,24 @@ class Complaint {
     this.status = 'submitted',
     this.createdAt,
     this.updatedAt,
+    this.photoUrl,
   });
 
   factory Complaint.fromJson(Map<String, dynamic> json) {
+    final rawPhoto = json['photo_url'];
     return Complaint(
-      id: json['id'],
-      name: json['name'] ?? '',
-      phone: json['phone'],
-      location: json['location'] ?? '',
-      lat: json['lat']?.toDouble(),
-      lon: json['lon']?.toDouble(),
-      category: json['category'] ?? 'Other',
-      description: json['description'] ?? '',
-      status: json['status'] ?? 'submitted',
-      createdAt: json['created_at'],
-      updatedAt: json['updated_at'],
+      id: json['id'] is num ? (json['id'] as num).toInt() : null,
+      name: json['name']?.toString() ?? '',
+      phone: json['phone']?.toString(),
+      location: json['location']?.toString() ?? '',
+      lat: json['lat'] is num ? (json['lat'] as num).toDouble() : null,
+      lon: json['lon'] is num ? (json['lon'] as num).toDouble() : null,
+      category: json['category']?.toString() ?? 'Other',
+      description: json['description']?.toString() ?? '',
+      status: json['status']?.toString() ?? 'submitted',
+      createdAt: json['created_at']?.toString(),
+      updatedAt: json['updated_at']?.toString(),
+      photoUrl: rawPhoto?.toString(),
     );
   }
 
@@ -289,5 +295,6 @@ class Complaint {
         'lon': lon,
         'category': category,
         'description': description,
+        if (photoUrl != null) 'photo_url': photoUrl,
       };
 }

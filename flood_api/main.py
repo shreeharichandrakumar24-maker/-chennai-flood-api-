@@ -10,6 +10,7 @@ GET  /api/v1/complaints    list complaints (?status=)
 POST /api/v1/complaints    submit a complaint
 GET  /api/v1/complaints/{id}
 PATCH /api/v1/complaints/{id}/status   update status
+PATCH /api/v1/complaints/{id}          attach Firebase photo URL
 DELETE /api/v1/complaints/{id}
 """
 import json
@@ -255,10 +256,18 @@ class ComplaintIn(BaseModel):
     lon: Optional[float] = None
     category: str = "Other"
     description: str = Field(..., min_length=1, max_length=2000)
+    photo_url: Optional[str] = Field(
+        None, max_length=2000,
+        description="Firebase Storage download URL for the report photo")
 
 
 class StatusIn(BaseModel):
     status: str = Field(..., description="submitted | in_progress | resolved")
+
+
+class PhotoIn(BaseModel):
+    photo_url: str = Field(..., min_length=1, max_length=2000,
+                           description="Firebase Storage download URL")
 
 
 # ---------------- Status / Weather / Prediction ----------------
@@ -340,6 +349,23 @@ def get_complaint(cid: int):
 def update_status(cid: int, body: StatusIn):
     try:
         row = store.update_complaint_status(cid, body.status)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    if not row:
+        raise HTTPException(404, "Complaint not found")
+    return row
+
+
+@app.patch("/api/v1/complaints/{cid}")
+def attach_photo(cid: int, body: PhotoIn):
+    """Attach a Firebase Storage photo URL to an existing complaint.
+
+    NEW endpoint (existing routes untouched): the mobile app creates the
+    text report first via POST, uploads the photo to Firebase, then calls
+    this to link the URL — so photo trouble never blocks a report.
+    """
+    try:
+        row = store.update_complaint_photo(cid, body.photo_url)
     except ValueError as exc:
         raise HTTPException(422, str(exc))
     if not row:

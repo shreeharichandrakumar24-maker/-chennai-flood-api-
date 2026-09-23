@@ -28,41 +28,33 @@ class ReportDetailScreen extends StatelessWidget {
     final center = hasCoords
         ? LatLng(complaint.lat!, complaint.lon!)
         : const LatLng(13.0827, 80.2707);
+    final remoteUrl = complaint.photoUrl;
     return Scaffold(
       appBar: AppBar(title: const Text('Report Detail')),
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
-          if (localPhotoPath != null)
+          if (remoteUrl != null && remoteUrl.isNotEmpty)
             ClipRRect(
               borderRadius: BorderRadius.circular(12),
-              child: Image.file(
-                File(localPhotoPath!),
+              child: Image.network(
+                remoteUrl,
                 height: 220,
                 width: double.infinity,
                 fit: BoxFit.cover,
+                loadingBuilder: (context, child, progress) =>
+                    progress == null
+                        ? child
+                        : const SizedBox(
+                            height: 220,
+                            child: Center(
+                                child: CircularProgressIndicator())),
+                errorBuilder: (_, __, ___) =>
+                    _localOrPlaceholder(localPhotoPath),
               ),
             )
           else
-            Container(
-              height: 120,
-              decoration: BoxDecoration(
-                color: Colors.grey.shade100,
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: const Center(
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Icon(Icons.image_not_supported,
-                        size: 36, color: Colors.grey),
-                    SizedBox(height: 8),
-                    Text('No photo attached',
-                        style: TextStyle(color: Colors.grey)),
-                  ],
-                ),
-              ),
-            ),
+            _localOrPlaceholder(localPhotoPath),
           const SizedBox(height: 16),
           Text(
             complaint.description,
@@ -141,6 +133,44 @@ class ReportDetailScreen extends StatelessWidget {
                 style: const TextStyle(fontWeight: FontWeight.w600)),
           ),
         ],
+      ),
+    );
+  }
+
+  /// Session-local file fallback, else the "no photo" placeholder.
+  Widget _localOrPlaceholder(String? path) {
+    if (path != null) {
+      return ClipRRect(
+        borderRadius: BorderRadius.circular(12),
+        child: Image.file(
+          File(path),
+          height: 220,
+          width: double.infinity,
+          fit: BoxFit.cover,
+          errorBuilder: (_, __, ___) => _noPhotoPlaceholder(),
+        ),
+      );
+    }
+    return _noPhotoPlaceholder();
+  }
+
+  Widget _noPhotoPlaceholder() {
+    return Container(
+      height: 120,
+      decoration: BoxDecoration(
+        color: Colors.grey.shade100,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: const Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.image_not_supported, size: 36, color: Colors.grey),
+            SizedBox(height: 8),
+            Text('No photo attached',
+                style: TextStyle(color: Colors.grey)),
+          ],
+        ),
       ),
     );
   }

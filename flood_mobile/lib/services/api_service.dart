@@ -227,6 +227,33 @@ class ApiService {
     }
   }
 
+  /// Attach a Firebase Storage photo URL to an existing complaint.
+  /// NEW endpoint (separate from the existing .../status route): the text
+  /// report is always created first, so photo trouble never blocks it.
+  static Future<Complaint> updateComplaintPhoto(int id, String photoUrl) async {
+    try {
+      final base = await ApiConfig.getBaseUrl();
+      final url = '$base/api/v1/complaints/$id';
+      final timeout =
+          await _timeoutFor(url, localSeconds: 15, publicSeconds: 45);
+      final response = await http
+          .patch(
+            Uri.parse(url),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({'photo_url': photoUrl}),
+          )
+          .timeout(timeout);
+
+      if (response.statusCode == 200) {
+        return Complaint.fromJson(
+            jsonDecode(response.body) as Map<String, dynamic>);
+      }
+      throw _serverError('Photo attach', response);
+    } catch (e) {
+      throw _toApiException(e);
+    }
+  }
+
   /// Fetch all complaints. Throws [ApiException] on failure.
   static Future<List<Complaint>> fetchComplaints({String? status}) async {
     try {

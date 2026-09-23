@@ -9,6 +9,7 @@ import 'package:latlong2/latlong.dart';
 import '../models/prediction_model.dart';
 import '../services/api_exception.dart';
 import '../services/api_service.dart';
+import '../services/photo_service.dart';
 import '../widgets/error_state.dart';
 import 'report_detail_screen.dart';
 
@@ -55,6 +56,12 @@ class _ReportScreenState extends State<ReportScreen>
   String _uiCategory = 'Waterlogging';
   bool _submitting = false;
   String? _submitError;
+  double _uploadProgress = 0;
+
+  // Photo waiting for a (re)try upload after its report already exists on
+  // the backend. Kept — together with the local file — so nothing is lost.
+  int? _pendingPhotoReportId;
+  bool _retryingPhoto = false;
 
   // Location: GPS default + manual pin on small map.
   Position? _position;
@@ -200,20 +207,48 @@ class _ReportScreenState extends State<ReportScreen>
       description: _descriptionController.text.trim(),
     );
     try {
+      // Step 1 — text report FIRST (photo trouble can never block it).
       final created =
           await ApiService.withRetry(
         () => ApiService.submitComplaint(complaint),
         label: 'reports/submit',
       );
-      // Remember the local photo for this report id (session-only).
+      // Step 2 — photo to Firebase, URL back to Render (both best-effort).
+      String? photoMessage;
       if (_photo != null && created.id != null) {
         _localPhotoPaths[created.id!] = _photo!.path;
+        if (PhotoService.isAvailable) {
+          try {
+            if (mounted) setState(() => _uploadProgress = 0);
+            final url = await PhotoService.uploadReportPhoto(
+              reportId: created.id!,
+              localPath: _photo!.path,
+              onProgress: (p) {
+                if (mounted) setState(() => _uploadProgress = p);
+              },
+            );
+            await ApiService.updateComplaintPhoto(created.id!, url);
+            _localPhotoPaths.remove(created.id!);
+            photoMessage = 'Photo uploaded ☁️';
+          } catch (e) {
+            // Report is SAFE on the backend; photo stays local for retry.
+            if (mounted) {
+              setState(() => _pendingPhotoReportId = created.id!);
+            }
+            photoMessage =
+                'Report saved, but photo upload failed — retry below';
+            debugPrint('[Report] photo step failed: $e');
+          }
+        } else {
+          photoMessage = 'Report saved (photo kept on device — Firebase not configured)';
+        }
       }
       if (!mounted) return;
       final hadPhoto = _photo != null;
       setState(() {
         _submitting = false;
-        _photo = null;
+        _uploadProgress = 0;
+        if (_pendingPhotoReportId == null) _photo = null;
       });
       _nameController.clear();
       _phoneController.clear();
@@ -223,8 +258,10 @@ class _ReportScreenState extends State<ReportScreen>
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
-                '✅ Report submitted${hadPhoto ? ' (photo kept on device)' : ''}!'),
-            backgroundColor: Colors.green,
+                '✅ Report submitted${photoMessage != null ? ' — $photoMessage' : hadPhoto ? '!' : '!'}'),
+            backgroundColor:
+                _pendingPhotoReportId != null ? Colors.orange : Colors.green,
+            duration: const Duration(seconds: 4),
           ),
         );
         _tabs.animateTo(1);
@@ -242,6 +279,48 @@ class _ReportScreenState extends State<ReportScreen>
       setState(() {
         _submitting = false;
         _submitError = e.toString();
+      });
+    }
+  }
+
+  /// Retry a failed Firebase photo upload for an already-saved report.
+  Future<void> _retryPendingPhoto() async {
+    final reportId = _pendingPhotoReportId;
+    final photo = _photo;
+    if (reportId == null || photo == null || _retryingPhoto) return;
+    if (mounted) {
+      setState(() {
+        _retryingPhoto = true;
+        _submitError = null;
+      });
+    }
+    try {
+      final url = await PhotoService.uploadReportPhoto(
+        reportId: reportId,
+        localPath: photo.path,
+      );
+      await ApiService.updateComplaintPhoto(reportId, url);
+      if (!mounted) return;
+      setState(() {
+        _retryingPhoto = false;
+        _pendingPhotoReportId = null;
+        _photo = null;
+        _localPhotoPaths.remove(reportId);
+      });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('✅ Photo uploaded and attached!'),
+            backgroundColor: Colors.green,
+          ),
+        );
+      }
+      await _loadComplaints();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _retryingPhoto = false;
+        _submitError = 'Photo retry failed: $e';
       });
     }
   }
@@ -337,6 +416,38 @@ class _ReportScreenState extends State<ReportScreen>
               const Text(
                 'Your entries were kept — fix the connection and tap "Retry now".',
                 style: TextStyle(fontSize: 12, color: Colors.red),
+              ),
+              const SizedBox(height: 12),
+            ],
+            // Photo uploaded to Firebase later / retry card.
+            if (_pendingPhotoReportId != null) ...[
+              Card(
+                color: Colors.orange.shade50,
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Row(
+                    children: [
+                      Icon(Icons.cloud_upload,
+                          color: Colors.orange.shade800),
+                      const SizedBox(width: 10),
+                      const Expanded(
+                        child: Text(
+                          'Report is saved on the server — only its photo still needs uploading.',
+                          style: TextStyle(fontSize: 13),
+                        ),
+                      ),
+                      FilledButton(
+                        onPressed:
+                            _retryingPhoto ? null : _retryPendingPhoto,
+                        style: FilledButton.styleFrom(
+                            backgroundColor: Colors.orange),
+                        child: Text(_retryingPhoto
+                            ? 'Uploading…'
+                            : 'Retry photo'),
+                      ),
+                    ],
+                  ),
+                ),
               ),
               const SizedBox(height: 12),
             ],
@@ -537,6 +648,23 @@ class _ReportScreenState extends State<ReportScreen>
               ),
             ),
             const SizedBox(height: 16),
+            if (_submitting && _uploadProgress > 0) ...[
+              Row(
+                children: [
+                  const Icon(Icons.cloud_upload,
+                      size: 18, color: Colors.blue),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: LinearProgressIndicator(value: _uploadProgress),
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                      'Photo ${(_uploadProgress * 100).toStringAsFixed(0)}%',
+                      style: const TextStyle(fontSize: 12)),
+                ],
+              ),
+              const SizedBox(height: 12),
+            ],
             FilledButton.icon(
               onPressed: _submitting ? null : _submitReport,
               icon: _submitting
@@ -549,9 +677,11 @@ class _ReportScreenState extends State<ReportScreen>
               label: Text(_submitting ? 'Submitting...' : 'Submit Report'),
             ),
             const SizedBox(height: 8),
-            const Text(
-              '⚠️ Demo complaint system (SQLite backend). Photo is kept on-device; text + location are uploaded.',
-              style: TextStyle(fontSize: 12, color: Colors.grey),
+            Text(
+              PhotoService.isAvailable
+                  ? '☁️ Photos upload to Firebase Storage; report text + location go to the Render backend.'
+                  : '⚠️ Firebase photo upload is not configured on this build — reports submit as text-only.',
+              style: const TextStyle(fontSize: 12, color: Colors.grey),
             ),
           ],
         ),
@@ -613,18 +743,7 @@ class _ReportScreenState extends State<ReportScreen>
               c.id != null ? _localPhotoPaths[c.id!] : null;
           return Card(
             child: ListTile(
-              leading: photoPath != null
-                  ? ClipRRect(
-                      borderRadius: BorderRadius.circular(8),
-                      child: Image.file(
-                        File(photoPath),
-                        width: 44,
-                        height: 44,
-                        fit: BoxFit.cover,
-                      ),
-                    )
-                  : Icon(_categoryIcon(c.category),
-                      color: _getStatusColor(c.status)),
+              leading: _reportThumbnail(c, photoPath),
               title: Text(
                 c.description,
                 maxLines: 2,
@@ -662,6 +781,37 @@ class _ReportScreenState extends State<ReportScreen>
         },
       ),
     );
+  }
+
+  /// Thumbnail: Firebase photo URL first (cloud, all devices), then the
+  /// session-local file, then the category icon.
+  Widget _reportThumbnail(Complaint c, String? photoPath) {
+    if (c.photoUrl != null && c.photoUrl!.isNotEmpty) {
+      return ClipRRect(
+        borderRadius: BorderRadius.circular(8),
+        child: Image.network(
+          c.photoUrl!,
+          width: 44,
+          height: 44,
+          fit: BoxFit.cover,
+          errorBuilder: (_, __, ___) =>
+              Icon(_categoryIcon(c.category), color: _getStatusColor(c.status)),
+        ),
+      );
+    }
+    if (photoPath != null) {
+      return ClipRRect(
+        borderRadius: BorderRadius.circular(8),
+        child: Image.file(
+          File(photoPath),
+          width: 44,
+          height: 44,
+          fit: BoxFit.cover,
+        ),
+      );
+    }
+    return Icon(_categoryIcon(c.category),
+        color: _getStatusColor(c.status));
   }
 
   Color _getStatusColor(String status) {

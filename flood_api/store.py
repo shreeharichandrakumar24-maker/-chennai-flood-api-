@@ -50,6 +50,11 @@ def init_db():
         );
         """
     )
+    # Migration: photo_url holds the Firebase Storage download URL for a
+    # complaint photo. Added idempotently so existing DBs keep working.
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(complaints)")]
+    if "photo_url" not in cols:
+        conn.execute("ALTER TABLE complaints ADD COLUMN photo_url TEXT")
     conn.commit()
     conn.close()
     seed_sample_complaints()
@@ -128,11 +133,11 @@ def create_complaint(data: dict) -> dict:
     cur = conn.execute(
         """INSERT INTO complaints
            (name, phone, location, lat, lon, category, description, status,
-            created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            photo_url, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (data["name"], data.get("phone"), data["location"],
          data.get("lat"), data.get("lon"), data.get("category", "Other"),
-         data["description"], status, ts, ts),
+         data["description"], status, data.get("photo_url"), ts, ts),
     )
     conn.commit()
     cid = cur.lastrowid
@@ -168,6 +173,21 @@ def update_complaint_status(cid: int, status: str) -> dict:
     conn.execute(
         "UPDATE complaints SET status = ?, updated_at = ? WHERE id = ?",
         (status, now_iso(), cid),
+    )
+    conn.commit()
+    row = conn.execute("SELECT * FROM complaints WHERE id = ?", (cid,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def update_complaint_photo(cid: int, photo_url: str) -> dict:
+    """Attach a Firebase Storage download URL to an existing complaint."""
+    if not photo_url or len(photo_url) > 2000:
+        raise ValueError("photo_url must be a non-empty URL (max 2000 chars)")
+    conn = _conn()
+    conn.execute(
+        "UPDATE complaints SET photo_url = ?, updated_at = ? WHERE id = ?",
+        (photo_url, now_iso(), cid),
     )
     conn.commit()
     row = conn.execute("SELECT * FROM complaints WHERE id = ?", (cid,)).fetchone()
