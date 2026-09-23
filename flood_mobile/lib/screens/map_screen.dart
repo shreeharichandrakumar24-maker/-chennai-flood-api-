@@ -475,18 +475,63 @@ class _FloodMapScreenState extends State<FloodMapScreen> {
   }
 
   void _showReportInfo(Complaint r) {
+    final photoUrl = r.photoUrl;
     showModalBottomSheet(
       context: context,
+      isScrollControlled: true,
       builder: (context) => Container(
         padding: const EdgeInsets.all(16),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            // Uploaded photo (Firebase URL) — same image as the Reports tab.
+            if (photoUrl != null && photoUrl.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 12),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(12),
+                  child: Image.network(
+                    photoUrl,
+                    height: 180,
+                    width: double.infinity,
+                    fit: BoxFit.cover,
+                    loadingBuilder: (context, child, progress) =>
+                        progress == null
+                            ? child
+                            : const SizedBox(
+                                height: 180,
+                                child: Center(
+                                    child: CircularProgressIndicator())),
+                    errorBuilder: (_, __, ___) => Container(
+                      height: 80,
+                      decoration: BoxDecoration(
+                        color: Colors.grey.shade100,
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: const Center(
+                        child: Icon(Icons.broken_image,
+                            color: Colors.grey),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
             Text(r.description,
                 style: Theme.of(context).textTheme.titleMedium),
             const SizedBox(height: 8),
-            Chip(label: Text(r.category)),
+            Wrap(
+              spacing: 8,
+              children: [
+                Chip(label: Text(r.category)),
+                if (photoUrl != null && photoUrl.isNotEmpty)
+                  const Chip(
+                    avatar: Icon(Icons.cloud_done,
+                        size: 16, color: Colors.green),
+                    label: Text('Photo attached'),
+                  ),
+              ],
+            ),
             const SizedBox(height: 8),
             Text('${r.location} • ${r.status}'),
             if (r.createdAt != null) Text('Submitted: ${r.createdAt}'),
