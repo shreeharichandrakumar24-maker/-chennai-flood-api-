@@ -1,7 +1,13 @@
-"""Realtime weather for Chennai via Open-Meteo (no API key required).
+"""Realtime weather for Chennai — multi-provider, no API key required.
 
-Open-Meteo endpoints used:
-  - /v1/forecast    current weather + past/forecast daily precipitation
+Provider chain (first success wins):
+  1. Open-Meteo  — current + past/future daily precipitation (only source
+     with the 18-day history the ML models need).
+  2. wttr.in     — live current + 3-day forecast (no usable history).
+  3. Offline stub (built by main.py, not here) — dataset-tail prediction.
+
+wttr.in was added because Open-Meteo persistently 429s shared cloud IPs
+(Render free tier), which left /weather serving an empty stub.
 """
 from datetime import date, datetime, timezone
 
@@ -14,11 +20,12 @@ log = logging.getLogger("flood-api")
 
 CHENNAI = {"latitude": 13.0827, "longitude": 80.2707}
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+WTTR_URL = "https://wttr.in/Chennai"
 PAST_DAYS = 18      # enough to build the 14-day rolling windows used by the models
 FORECAST_DAYS = 3
 
-# Open-Meteo asks API consumers to identify themselves; shared datacenter IPs
-# (e.g. Render free tier) get rate-limited (HTTP 429) otherwise.
+# Identify ourselves everywhere; shared datacenter IPs (e.g. Render free
+# tier) get rate-limited (HTTP 429) otherwise.
 HEADERS = {"User-Agent": "ChennaiFloodApp/1.0 (college-project; contact: admin@example.com)"}
 
 # Retry policy for transient Open-Meteo failures (429 rate limit / 5xx).
@@ -49,12 +56,27 @@ def _describe(code):
 
 
 def fetch_weather() -> dict:
-    """Fetch current conditions and a daily precipitation timeline.
+    """Current conditions + daily precipitation timeline.
 
-    Retries transient failures (HTTP 429 rate limit — common on shared
-    cloud IPs — and 5xx) with backoff, honoring the server's Retry-After
-    header when present. Raises the last error if all attempts fail.
+    Tries Open-Meteo first (with 429/5xx retries), then wttr.in for live
+    display weather (no model history). Raises the last error only if every
+    provider fails — main.py then builds the offline fallback.
     """
+    last_exc = None
+    try:
+        return _fetch_openmeteo()
+    except Exception as exc:
+        last_exc = exc
+        log.warning("Open-Meteo failed, trying wttr.in: %s", exc)
+    try:
+        return _fetch_wttr()
+    except Exception as exc:
+        last_exc = exc
+        log.warning("wttr.in failed too: %s", exc)
+    raise last_exc
+
+
+def _fetch_openmeteo() -> dict:
     params = {
         "latitude": CHENNAI["latitude"],
         "longitude": CHENNAI["longitude"],
@@ -147,5 +169,60 @@ def fetch_weather() -> dict:
             "icon": icon,
         },
         "history": history,
+        "forecast": forecast,
+    }
+
+
+def _fnum(value, default=0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _fetch_wttr() -> dict:
+    """Live Chennai current + 3-day forecast from wttr.in (no key).
+
+    Returns the same shape as Open-Meteo but with an EMPTY history —
+    wttr.in has no past-data endpoint, so callers must not use this for
+    model input (main.py pairs it with offline history instead).
+    """
+    resp = requests.get(WTTR_URL, params={"format": "j1"},
+                        headers=HEADERS, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()  # raises if wttr.in returns an HTML captcha block
+
+    cur = (data.get("current_condition") or [{}])[0]
+    desc = ((cur.get("weatherDesc") or [{}])[0].get("value") or "Unknown")
+    today_iso = date.today().isoformat()
+
+    forecast = []
+    for day in (data.get("weather") or [])[:4]:
+        hours = day.get("hourly") or []
+        precip = sum(_fnum(h.get("precipMM")) for h in hours)
+        temps = [_fnum(h.get("tempC")) for h in hours] or [0.0]
+        forecast.append({
+            "date": day.get("date") or today_iso,
+            "precip_mm": round(precip, 1),
+            "t_max": _fnum(day.get("maxtempC"), max(temps)),
+            "t_min": _fnum(day.get("mintempC"), min(temps)),
+        })
+
+    return {
+        "source": "wttr.in",
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "today_iso": today_iso,
+        "current": {
+            "temp_c": _fnum(cur.get("temp_C")),
+            "feels_like_c": _fnum(cur.get("FeelsLikeC")),
+            "humidity_pct": int(_fnum(cur.get("humidity"))),
+            "precip_mm": _fnum(cur.get("precipMM")),
+            "wind_kmh": _fnum(cur.get("windspeedKmph")),
+            "cloud_pct": int(_fnum(cur.get("cloudcover"))),
+            "weather_code": -1,
+            "description": str(desc),
+            "icon": "unknown",
+        },
+        "history": {},  # wttr.in has no past data — NOT for model input
         "forecast": forecast,
     }

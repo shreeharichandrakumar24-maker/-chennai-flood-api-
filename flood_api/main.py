@@ -63,16 +63,32 @@ def do_refresh(force: bool = False) -> None:
     STATE["last_attempt"] = now
     try:
         w = weather_mod.fetch_weather()
-        pred = predictor.run_prediction(w["history"], w["today_iso"])
+        history = w.get("history") or {}
+        if isinstance(history, dict) and len(history) >= 14:
+            # Full live path (Open-Meteo): usable model history.
+            pred = predictor.run_prediction(history, w["today_iso"])
+            live = True
+        else:
+            # Display-only provider (wttr.in has no past data): pair its
+            # LIVE current/forecast with offline model history so the
+            # Forecast tab and weather card work while predictions stay
+            # honest (marked stale).
+            fb_history, _fb_source = _offline_history()
+            pred = predictor.run_prediction(fb_history, w["today_iso"])
+            live = False
+            w = dict(w)
+            w["note"] = ("Live display weather; prediction history is "
+                         "offline (Open-Meteo rate-limited).")
         pred["weather"] = w
         pred["generated_at"] = w["fetched_at"]
-        pred["stale"] = False
+        pred["stale"] = not live
         STATE["last_refresh"] = w["fetched_at"]
         STATE["weather"] = w
         STATE["prediction"] = pred
         STATE["error"] = None
         store.save_prediction(pred)
-        log.info("Prediction refreshed at %s", w["fetched_at"])
+        log.info("Prediction refreshed at %s (live=%s, source=%s)",
+                 w["fetched_at"], live, w.get("source"))
     except Exception as exc:
         STATE["error"] = str(exc)
         log.exception("refresh failed")
@@ -127,16 +143,13 @@ def _resurrect_last_prediction() -> None:
     log.info("Serving stale prediction from %s", last.get("generated_at"))
 
 
-def _offline_fallback_prediction() -> None:
-    """Build a stale prediction with zero network access.
+def _offline_history() -> tuple:
+    """Model-usable rainfall history with zero network access.
 
-    Tries, in order: (1) the weather history embedded in the most recent
-    saved prediction (fresh if < 48h old), else (2) the local rainfall
-    dataset tail. Reservoir always comes from the offline baseline, so
-    this path only needs the ML model files — never Open-Meteo.
+    Returns (history_dict, source_label). Prefers the weather history
+    embedded in the most recent saved prediction (if < 48h old), else the
+    local rainfall dataset tail. Raises if neither is available.
     """
-    history = None
-    source = "offline-dataset-tail"
     try:
         last = store.last_prediction()
         w = (last or {}).get("weather") or {}
@@ -149,16 +162,28 @@ def _offline_fallback_prediction() -> None:
             except Exception:
                 age_h = 1e9
             if age_h < 48:
-                history = {k: float(v) for k, v in hist.items()}
-                source = "last-saved-weather"
+                return ({k: float(v) for k, v in hist.items()},
+                        "last-saved-weather")
     except Exception:
-        log.exception("offline fallback: could not reuse saved weather")
-    if history is None:
-        try:
-            history = predictor.fallback_history()
-        except Exception:
-            log.exception("offline fallback: dataset tail failed")
-            return
+        log.exception("offline history: could not reuse saved weather")
+    return (predictor.fallback_history(), "offline-dataset-tail")
+
+
+def _offline_fallback_prediction() -> None:
+    """Build a stale prediction with zero network access.
+
+    Tries, in order: (1) the weather history embedded in the most recent
+    saved prediction (fresh if < 48h old), else (2) the local rainfall
+    dataset tail. Reservoir always comes from the offline baseline, so
+    this path only needs the ML model files — never Open-Meteo.
+    """
+    history = None
+    source = "offline-dataset-tail"
+    try:
+        history, source = _offline_history()
+    except Exception:
+        log.exception("offline fallback: no history available")
+        return
     try:
         today_iso = datetime.now(timezone.utc).date().isoformat()
         pred = predictor.run_prediction(history, today_iso)

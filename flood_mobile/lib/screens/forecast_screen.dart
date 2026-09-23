@@ -43,6 +43,15 @@ class _ForecastScreenState extends State<ForecastScreen> {
           if (mounted) setState(() => _retryAttempt = a);
         },
       );
+      // The backend serves an HTTP-200 OFFLINE stub (current=null,
+      // forecast=[]) when every provider is down. That renders as a blank
+      // screen, so treat it as a failure and drop to the direct chain
+      // (Open-Meteo → wttr.in from the phone itself).
+      if (weather.current == null &&
+          (weather.forecast == null || weather.forecast!.isEmpty)) {
+        throw const ApiException(
+            'Backend has no live weather (offline stub) — trying phone-direct providers');
+      }
       if (!mounted) return;
       setState(() {
         _weather = weather;
@@ -156,7 +165,7 @@ class _ForecastScreenState extends State<ForecastScreen> {
                               Expanded(
                                 child: Text(
                                   _isDirectFallback
-                                      ? 'Live weather direct from Open-Meteo (backend unreachable — predictions need backend, weather does not). Pull to retry backend.'
+                                      ? 'Live weather direct from ${_weather?.source ?? 'phone'} (backend unreachable — predictions need backend, weather does not). Pull to retry backend.'
                                       : 'Data from Open-Meteo API via backend (free, no key required)',
                                   style: TextStyle(
                                       color: _isDirectFallback

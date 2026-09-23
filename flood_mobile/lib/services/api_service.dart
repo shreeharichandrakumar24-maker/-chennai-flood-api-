@@ -273,11 +273,92 @@ class ApiService {
     }
   }
 
-  /// Direct live-weather fallback straight from Open-Meteo (no backend).
+  /// Direct live-weather fallback with NO backend.
+  /// Chain: Open-Meteo direct → wttr.in direct (both free, no key).
   /// Used by the Forecast screen when the backend (local or Render) is
   /// unreachable, so live weather still works. Shape matches the backend
   /// /weather response subset the app renders.
   static Future<WeatherResponse> fetchDirectWeather() async {
+    Object lastError = const ApiException('All weather providers failed');
+    try {
+      return await _fetchDirectOpenMeteo();
+    } catch (e) {
+      lastError = e;
+      debugPrint('[ApiService] direct Open-Meteo failed, trying wttr.in: $e');
+    }
+    try {
+      return await _fetchDirectWttr();
+    } catch (e) {
+      lastError = e;
+    }
+    throw _toApiException(lastError);
+  }
+
+  static double _dnum(dynamic v) =>
+      v is num ? v.toDouble() : double.tryParse('$v') ?? 0.0;
+
+  /// wttr.in direct: https://wttr.in/Chennai?format=j1 (free, no key).
+  /// Verified reachable when Open-Meteo 429s cloud IPs.
+  static Future<WeatherResponse> _fetchDirectWttr() async {
+    const url = 'https://wttr.in/Chennai?format=j1';
+    try {
+      debugPrint('[ApiService] GET (direct) $url');
+      final response = await http.get(Uri.parse(url), headers: {
+        'User-Agent': 'ChennaiFloodApp/1.0',
+        'Accept': 'application/json',
+      }).timeout(const Duration(seconds: 25));
+      if (response.statusCode != 200) {
+        throw ApiException('wttr.in error: HTTP ${response.statusCode}',
+            statusCode: response.statusCode);
+      }
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      final cur = (data['current_condition'] as List).isNotEmpty
+          ? Map<String, dynamic>.from(
+              (data['current_condition'] as List).first as Map)
+          : <String, dynamic>{};
+      String desc = 'Unknown';
+      try {
+        desc = (((cur['weatherDesc'] as List).first as Map)['value'] as String?) ??
+            'Unknown';
+      } catch (_) {}
+      final forecast = <Map<String, dynamic>>[];
+      for (final day in (data['weather'] as List).take(4)) {
+        final d = Map<String, dynamic>.from(day as Map);
+        final hours = (d['hourly'] as List?) ?? [];
+        double precip = 0;
+        for (final h in hours) {
+          precip += _dnum((h as Map)['precipMM']);
+        }
+        forecast.add({
+          'date': d['date'] ?? '',
+          'precip_mm': double.parse(precip.toStringAsFixed(1)),
+          't_max': _dnum(d['maxtempC']),
+          't_min': _dnum(d['mintempC']),
+        });
+      }
+      return WeatherResponse.fromJson({
+        'source': 'wttr.in-direct',
+        'fetched_at': DateTime.now().toUtc().toIso8601String(),
+        'today_iso': forecast.isNotEmpty ? forecast.first['date'] : null,
+        'current': {
+          'temp_c': _dnum(cur['temp_C']),
+          'feels_like_c': _dnum(cur['FeelsLikeC']),
+          'humidity_pct': _dnum(cur['humidity']).toInt(),
+          'precip_mm': _dnum(cur['precipMM']),
+          'wind_kmh': _dnum(cur['windspeedKmph']),
+          'cloud_pct': _dnum(cur['cloudcover']).toInt(),
+          'weather_code': -1,
+          'description': desc,
+          'icon': 'unknown',
+        },
+        'forecast': forecast,
+      });
+    } catch (e) {
+      throw _toApiException(e);
+    }
+  }
+
+  static Future<WeatherResponse> _fetchDirectOpenMeteo() async {
     const url =
         'https://api.open-meteo.com/v1/forecast?latitude=13.0827&longitude=80.2707'
         '&current=temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,weather_code,wind_speed_10m,cloud_cover'
