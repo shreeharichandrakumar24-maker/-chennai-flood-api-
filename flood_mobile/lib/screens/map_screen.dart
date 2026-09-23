@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:geolocator/geolocator.dart';
+import '../models/prediction_model.dart';
+import '../services/api_service.dart';
 
 class FloodMapScreen extends StatefulWidget {
   const FloodMapScreen({super.key});
@@ -16,6 +18,11 @@ class _FloodMapScreenState extends State<FloodMapScreen> {
   Position? _currentPosition;
   bool _locationLoading = false;
   String? _locationError;
+  // P4: report pins overlay (toggle).
+  bool _showReports = false;
+  List<Complaint> _reports = [];
+  bool _reportsLoading = false;
+  String? _reportsError;
 
   // Chennai center
   static const LatLng _chennaiCenter = LatLng(13.0827, 80.2707);
@@ -36,6 +43,33 @@ class _FloodMapScreenState extends State<FloodMapScreen> {
   void initState() {
     super.initState();
     _getCurrentLocation();
+  }
+
+  Future<void> _toggleReports(bool show) async {
+    setState(() {
+      _showReports = show;
+      if (show) {
+        _reportsLoading = true;
+        _reportsError = null;
+      }
+    });
+    if (!show) return;
+    try {
+      final items = await ApiService.fetchComplaints();
+      if (!mounted) return;
+      setState(() {
+        _reports = items
+            .where((c) => c.lat != null && c.lon != null)
+            .toList();
+        _reportsLoading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _reportsLoading = false;
+        _reportsError = 'Could not load reports: $e';
+      });
+    }
   }
 
   Future<void> _getCurrentLocation() async {
@@ -130,6 +164,16 @@ class _FloodMapScreenState extends State<FloodMapScreen> {
               const PopupMenuItem(value: 'both', child: Text('Both')),
             ],
           ),
+          // P4: toggle report pins overlay.
+          Row(
+            children: [
+              const Text('Reports', style: TextStyle(fontSize: 12)),
+              Switch(
+                value: _showReports,
+                onChanged: _toggleReports,
+              ),
+            ],
+          ),
         ],
       ),
       body: Stack(
@@ -148,6 +192,46 @@ class _FloodMapScreenState extends State<FloodMapScreen> {
               MarkerLayer(markers: _buildMarkers()),
             ],
           ),
+
+          // Reports overlay error (P2: distinct failure, not silent)
+          if (_showReports && _reportsError != null)
+            Positioned(
+              top: 8,
+              left: 8,
+              right: 8,
+              child: Material(
+                elevation: 4,
+                borderRadius: BorderRadius.circular(8),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: Colors.red.shade50,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: Colors.red.shade200),
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(Icons.cloud_off, color: Colors.red.shade700, size: 18),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          _reportsError!,
+                          style: TextStyle(
+                            color: Colors.red.shade900,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ),
+                      TextButton(
+                        onPressed: () => _toggleReports(true),
+                        child: Text('Retry now',
+                            style: TextStyle(color: Colors.red.shade800)),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
 
           // Location error banner
           if (_locationError != null)
@@ -205,6 +289,9 @@ class _FloodMapScreenState extends State<FloodMapScreen> {
                     _legendItem(Colors.orange, 'MODERATE Risk'),
                     _legendItem(Colors.green, 'LOW Risk'),
                     _legendItem(Colors.teal, 'Shelter'),
+                    if (_showReports)
+                      _legendItem(Colors.deepPurple,
+                          _reportsLoading ? 'Reports (loading...)' : 'Reports (${_reports.length})'),
                     if (_currentPosition != null)
                       _legendItem(Colors.blue, 'Your Location'),
                   ],
@@ -331,6 +418,30 @@ class _FloodMapScreenState extends State<FloodMapScreen> {
       }
     }
 
+    // P4: citizen report pins overlay.
+    if (_showReports) {
+      for (final r in _reports) {
+        markers.add(
+          Marker(
+            point: LatLng(r.lat!, r.lon!),
+            width: 40,
+            height: 40,
+            child: GestureDetector(
+              onTap: () => _showReportInfo(r),
+              child: Container(
+                decoration: BoxDecoration(
+                  color: Colors.deepPurple,
+                  shape: BoxShape.circle,
+                  border: Border.all(color: Colors.white, width: 2),
+                ),
+                child: const Icon(Icons.report, color: Colors.white, size: 20),
+              ),
+            ),
+          ),
+        );
+      }
+    }
+
     return markers;
   }
 
@@ -361,6 +472,28 @@ class _FloodMapScreenState extends State<FloodMapScreen> {
       default:
         return Colors.green;
     }
+  }
+
+  void _showReportInfo(Complaint r) {
+    showModalBottomSheet(
+      context: context,
+      builder: (context) => Container(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(r.description,
+                style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 8),
+            Chip(label: Text(r.category)),
+            const SizedBox(height: 8),
+            Text('${r.location} • ${r.status}'),
+            if (r.createdAt != null) Text('Submitted: ${r.createdAt}'),
+          ],
+        ),
+      ),
+    );
   }
 
   void _showZoneInfo(Map<String, dynamic> zone) {

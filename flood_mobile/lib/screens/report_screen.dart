@@ -1,7 +1,26 @@
-import 'package:flutter/material.dart';
-import '../services/api_service.dart';
-import '../models/prediction_model.dart';
+import 'dart:io';
 
+import 'package:flutter/material.dart';
+import 'package:flutter_map/flutter_map.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:latlong2/latlong.dart';
+
+import '../models/prediction_model.dart';
+import '../services/api_exception.dart';
+import '../services/api_service.dart';
+import '../widgets/error_state.dart';
+import 'report_detail_screen.dart';
+
+/// P4 citizen reporting — full flow on top of the existing
+/// POST/GET /api/v1/complaints endpoints (no endpoint changes).
+///
+/// Spec categories (UI) → backend categories (wire) mapping keeps the
+/// existing backend untouched:
+///   Waterlogging → Waterlogging
+///   Blocked road → Road closure
+///   Damaged infrastructure → House/Property damage
+///   Other → Other
 class ReportScreen extends StatefulWidget {
   const ReportScreen({super.key});
 
@@ -9,260 +28,640 @@ class ReportScreen extends StatefulWidget {
   State<ReportScreen> createState() => _ReportScreenState();
 }
 
-class _ReportScreenState extends State<ReportScreen> {
+class _ReportScreenState extends State<ReportScreen>
+    with SingleTickerProviderStateMixin {
+  late final TabController _tabs;
+
   final _formKey = GlobalKey<FormState>();
   final _nameController = TextEditingController();
   final _phoneController = TextEditingController();
   final _locationController = TextEditingController();
   final _descriptionController = TextEditingController();
 
-  String _category = 'Waterlogging';
-  bool _submitting = false;
-  List<Complaint> _complaints = [];
-  bool _loadingComplaints = true;
-
-  final List<String> _categories = [
+  // P4 spec categories (UI).
+  static const _uiCategories = [
     'Waterlogging',
-    'Drainage blocked',
-    'River/Storm surge',
-    'Road closure',
-    'House/Property damage',
-    'Power outage',
+    'Blocked road',
+    'Damaged infrastructure',
     'Other',
   ];
+  static const _toBackend = {
+    'Waterlogging': 'Waterlogging',
+    'Blocked road': 'Road closure',
+    'Damaged infrastructure': 'House/Property damage',
+    'Other': 'Other',
+  };
+
+  String _uiCategory = 'Waterlogging';
+  bool _submitting = false;
+  String? _submitError;
+
+  // Location: GPS default + manual pin on small map.
+  Position? _position;
+  LatLng? _pickedPin;
+  String? _locationError;
+  final MapController _miniMap = MapController();
+
+  // Optional photo (local-only preview; backend row has no photo column,
+  // so the file is kept in-session and shown in the detail view).
+  XFile? _photo;
+  final _picker = ImagePicker();
+  final Map<int, String> _localPhotoPaths = {};
+
+  List<Complaint> _complaints = [];
+  bool _loadingComplaints = true;
+  String? _listError;
 
   @override
   void initState() {
     super.initState();
+    _tabs = TabController(length: 2, vsync: this);
     _loadComplaints();
+    _initGps();
+  }
+
+  @override
+  void dispose() {
+    _tabs.dispose();
+    _nameController.dispose();
+    _phoneController.dispose();
+    _locationController.dispose();
+    _descriptionController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _initGps() async {
+    try {
+      bool enabled = await Geolocator.isLocationServiceEnabled();
+      if (!enabled) {
+        if (mounted) {
+          setState(
+              () => _locationError = 'Location services disabled — enter area manually.');
+        }
+        return;
+      }
+      var perm = await Geolocator.checkPermission();
+      if (perm == LocationPermission.denied) {
+        perm = await Geolocator.requestPermission();
+      }
+      if (perm == LocationPermission.denied ||
+          perm == LocationPermission.deniedForever) {
+        if (mounted) {
+          setState(() =>
+              _locationError = 'Location permission denied — enter area manually.');
+        }
+        return;
+      }
+      final pos = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
+      );
+      if (!mounted) return;
+      setState(() {
+        _position = pos;
+        _pickedPin ??= LatLng(pos.latitude, pos.longitude);
+        _locationController.text = _locationController.text.isEmpty
+            ? '${pos.latitude.toStringAsFixed(4)}, ${pos.longitude.toStringAsFixed(4)}'
+            : _locationController.text;
+      });
+      try {
+        _miniMap.move(_pickedPin!, 14);
+      } catch (_) {}
+    } catch (e) {
+      if (mounted) {
+        setState(() => _locationError = 'GPS unavailable: $e');
+      }
+    }
   }
 
   Future<void> _loadComplaints() async {
-    setState(() => _loadingComplaints = true);
-    final complaints = await ApiService.fetchComplaints();
-    setState(() {
-      _complaints = complaints;
-      _loadingComplaints = false;
-    });
+    if (mounted) {
+      setState(() {
+        _loadingComplaints = true;
+        _listError = null;
+      });
+    }
+    try {
+      final items = await ApiService.withRetry(
+        () => ApiService.fetchComplaints(),
+        label: 'reports/list',
+      );
+      if (!mounted) return;
+      setState(() {
+        _complaints = items; // backend returns most-recent-first
+        _loadingComplaints = false;
+      });
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loadingComplaints = false;
+        _listError = e.message;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loadingComplaints = false;
+        _listError = e.toString();
+      });
+    }
+  }
+
+  Future<void> _pickPhoto(ImageSource source) async {
+    try {
+      final file = await _picker.pickImage(source: source, maxWidth: 1600);
+      if (file != null && mounted) {
+        setState(() => _photo = file);
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Photo picker failed: $e')),
+        );
+      }
+    }
   }
 
   Future<void> _submitReport() async {
     if (!_formKey.currentState!.validate()) return;
-
-    setState(() => _submitting = true);
-
+    if (mounted) {
+      setState(() {
+        _submitting = true;
+        _submitError = null;
+      });
+    }
     final complaint = Complaint(
       name: _nameController.text.trim(),
-      phone: _phoneController.text.trim(),
+      phone: _phoneController.text.trim().isEmpty
+          ? null
+          : _phoneController.text.trim(),
       location: _locationController.text.trim(),
-      category: _category,
+      lat: _pickedPin?.latitude ?? _position?.latitude,
+      lon: _pickedPin?.longitude ?? _position?.longitude,
+      category: _toBackend[_uiCategory] ?? 'Other',
       description: _descriptionController.text.trim(),
     );
-
-    final result = await ApiService.submitComplaint(complaint);
-
-    setState(() => _submitting = false);
-
-    if (result != null) {
-      _formKey.currentState!.reset();
+    try {
+      final created =
+          await ApiService.withRetry(
+        () => ApiService.submitComplaint(complaint),
+        label: 'reports/submit',
+      );
+      // Remember the local photo for this report id (session-only).
+      if (_photo != null && created.id != null) {
+        _localPhotoPaths[created.id!] = _photo!.path;
+      }
+      if (!mounted) return;
+      final hadPhoto = _photo != null;
+      setState(() {
+        _submitting = false;
+        _photo = null;
+      });
       _nameController.clear();
       _phoneController.clear();
       _locationController.clear();
       _descriptionController.clear();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+                '✅ Report submitted${hadPhoto ? ' (photo kept on device)' : ''}!'),
+            backgroundColor: Colors.green,
+          ),
+        );
+        _tabs.animateTo(1);
+      }
+      await _loadComplaints();
+    } on ApiException catch (e) {
+      // FAILURE: keep every entered field + photo so nothing is lost.
+      if (!mounted) return;
+      setState(() {
+        _submitting = false;
+        _submitError = e.message;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _submitting = false;
+        _submitError = e.toString();
+      });
+    }
+  }
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('✅ Report submitted successfully!'),
-          backgroundColor: Colors.green,
-        ),
-      );
-      _loadComplaints();
-    } else {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('❌ Failed to submit report. Try again.'),
-          backgroundColor: Colors.red,
-        ),
-      );
+  String _timeAgo(String? iso) {
+    if (iso == null || iso.isEmpty) return 'unknown time';
+    try {
+      final dt = DateTime.parse(iso).toLocal();
+      final diff = DateTime.now().difference(dt);
+      if (diff.inMinutes < 1) return 'just now';
+      if (diff.inMinutes < 60) return '${diff.inMinutes}m ago';
+      if (diff.inHours < 24) return '${diff.inHours}h ago';
+      return '${diff.inDays}d ago';
+    } catch (_) {
+      return iso;
+    }
+  }
+
+  String _distanceLabel(Complaint c) {
+    if (_position == null || c.lat == null || c.lon == null) {
+      return 'distance unknown';
+    }
+    final m = Geolocator.distanceBetween(
+      _position!.latitude,
+      _position!.longitude,
+      c.lat!,
+      c.lon!,
+    );
+    if (m < 1000) return '${m.toStringAsFixed(0)} m away';
+    return '${(m / 1000).toStringAsFixed(1)} km away';
+  }
+
+  IconData _categoryIcon(String backendCategory) {
+    switch (backendCategory) {
+      case 'Waterlogging':
+        return Icons.water_drop;
+      case 'Road closure':
+        return Icons.block;
+      case 'House/Property damage':
+        return Icons.home_repair_service;
+      case 'Drainage blocked':
+        return Icons.plumbing;
+      case 'Power outage':
+        return Icons.power_off;
+      case 'River/Storm surge':
+        return Icons.waves;
+      default:
+        return Icons.report;
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    return DefaultTabController(
-      length: 2,
-      child: Scaffold(
-        appBar: AppBar(
-          title: const Text('📋 Report Issue'),
-          bottom: const TabBar(
-            tabs: [
-              Tab(text: 'Submit Report'),
-              Tab(text: 'My Reports'),
-            ],
-          ),
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('📋 Report Issue'),
+        bottom: TabBar(
+          controller: _tabs,
+          tabs: const [
+            Tab(text: 'Submit Report'),
+            Tab(text: 'Reports'),
+          ],
         ),
-        body: TabBarView(
+      ),
+      body: TabBarView(
+        controller: _tabs,
+        children: [
+          _buildForm(),
+          _buildList(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildForm() {
+    final pin = _pickedPin ??
+        (_position != null
+            ? LatLng(_position!.latitude, _position!.longitude)
+            : const LatLng(13.0827, 80.2707));
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(16),
+      child: Form(
+        key: _formKey,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            // Submit Form
-            SingleChildScrollView(
-              padding: const EdgeInsets.all(16),
-              child: Form(
-                key: _formKey,
+            if (_submitError != null) ...[
+              ConnectionFailedBanner(
+                message: _submitError!,
+                onRetryNow: _submitting ? null : _submitReport,
+              ),
+              const SizedBox(height: 4),
+              const Text(
+                'Your entries were kept — fix the connection and tap "Retry now".',
+                style: TextStyle(fontSize: 12, color: Colors.red),
+              ),
+              const SizedBox(height: 12),
+            ],
+            TextFormField(
+              controller: _nameController,
+              decoration: const InputDecoration(
+                labelText: 'Your Name *',
+                border: OutlineInputBorder(),
+                prefixIcon: Icon(Icons.person),
+              ),
+              validator: (v) =>
+                  v == null || v.trim().isEmpty ? 'Name is required' : null,
+            ),
+            const SizedBox(height: 12),
+            TextFormField(
+              controller: _phoneController,
+              decoration: const InputDecoration(
+                labelText: 'Phone (optional)',
+                border: OutlineInputBorder(),
+                prefixIcon: Icon(Icons.phone),
+              ),
+              keyboardType: TextInputType.phone,
+            ),
+            const SizedBox(height: 12),
+            TextFormField(
+              controller: _locationController,
+              decoration: const InputDecoration(
+                labelText: 'Location / Area *',
+                border: OutlineInputBorder(),
+                prefixIcon: Icon(Icons.location_on),
+              ),
+              validator: (v) => v == null || v.trim().isEmpty
+                  ? 'Location is required'
+                  : null,
+            ),
+            if (_locationError != null) ...[
+              const SizedBox(height: 6),
+              Text(_locationError!,
+                  style: const TextStyle(fontSize: 12, color: Colors.orange)),
+            ],
+            const SizedBox(height: 12),
+            // Small map: GPS default pin, tap to adjust.
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(12),
                 child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    // Name
-                    TextFormField(
-                      controller: _nameController,
-                      decoration: const InputDecoration(
-                        labelText: 'Your Name *',
-                        border: OutlineInputBorder(),
-                        prefixIcon: Icon(Icons.person),
-                      ),
-                      validator: (v) =>
-                          v == null || v.isEmpty ? 'Name is required' : null,
-                    ),
-                    const SizedBox(height: 12),
-
-                    // Phone
-                    TextFormField(
-                      controller: _phoneController,
-                      decoration: const InputDecoration(
-                        labelText: 'Phone (optional)',
-                        border: OutlineInputBorder(),
-                        prefixIcon: Icon(Icons.phone),
-                      ),
-                      keyboardType: TextInputType.phone,
-                    ),
-                    const SizedBox(height: 12),
-
-                    // Location
-                    TextFormField(
-                      controller: _locationController,
-                      decoration: const InputDecoration(
-                        labelText: 'Location / Area *',
-                        border: OutlineInputBorder(),
-                        prefixIcon: Icon(Icons.location_on),
-                      ),
-                      validator: (v) =>
-                          v == null || v.isEmpty ? 'Location is required' : null,
-                    ),
-                    const SizedBox(height: 12),
-
-                    // Category
-                    DropdownButtonFormField<String>(
-                      initialValue: _category,
-                      decoration: const InputDecoration(
-                        labelText: 'Category',
-                        border: OutlineInputBorder(),
-                        prefixIcon: Icon(Icons.category),
-                      ),
-                      items: _categories
-                          .map((c) => DropdownMenuItem(value: c, child: Text(c)))
-                          .toList(),
-                      onChanged: (v) => setState(() => _category = v!),
-                    ),
-                    const SizedBox(height: 12),
-
-                    // Description
-                    TextFormField(
-                      controller: _descriptionController,
-                      decoration: const InputDecoration(
-                        labelText: 'Description *',
-                        border: OutlineInputBorder(),
-                        alignLabelWithHint: true,
-                      ),
-                      maxLines: 4,
-                      validator: (v) =>
-                          v == null || v.isEmpty ? 'Description is required' : null,
-                    ),
-                    const SizedBox(height: 16),
-
-                    // Submit Button
-                    FilledButton.icon(
-                      onPressed: _submitting ? null : _submitReport,
-                      icon: _submitting
-                          ? const SizedBox(
-                              width: 20,
-                              height: 20,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.send),
-                      label: Text(_submitting ? 'Submitting...' : 'Submit Report'),
-                    ),
-
+                    const Text('Pin location (tap map to adjust)',
+                        style: TextStyle(fontWeight: FontWeight.w600)),
                     const SizedBox(height: 8),
-                    const Text(
-                      '⚠️ This is a demo complaint system. In production, reports would be sent to the Greater Chennai Corporation.',
-                      style: TextStyle(fontSize: 12, color: Colors.grey),
+                    SizedBox(
+                      height: 180,
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(8),
+                        child: FlutterMap(
+                          mapController: _miniMap,
+                          options: MapOptions(
+                            initialCenter: pin,
+                            initialZoom: 13,
+                            onTap: (_, latLng) {
+                              setState(() {
+                                _pickedPin = latLng;
+                                _locationController.text =
+                                    '${latLng.latitude.toStringAsFixed(4)}, ${latLng.longitude.toStringAsFixed(4)}';
+                              });
+                            },
+                          ),
+                          children: [
+                            TileLayer(
+                              urlTemplate:
+                                  'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                              userAgentPackageName:
+                                  'com.example.chennai_flood',
+                            ),
+                            MarkerLayer(markers: [
+                              Marker(
+                                point: pin,
+                                width: 40,
+                                height: 40,
+                                child: const Icon(Icons.location_pin,
+                                    color: Colors.red, size: 36),
+                              ),
+                            ]),
+                          ],
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      'Lat: ${pin.latitude.toStringAsFixed(4)}, Lon: ${pin.longitude.toStringAsFixed(4)}',
+                      style: const TextStyle(fontSize: 12, color: Colors.grey),
                     ),
                   ],
                 ),
               ),
             ),
-
-            // My Reports
-            _loadingComplaints
-                ? const Center(child: CircularProgressIndicator())
-                : _complaints.isEmpty
-                    ? const Center(
-                        child: Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            Icon(Icons.inbox, size: 64, color: Colors.grey),
-                            SizedBox(height: 16),
-                            Text('No reports submitted yet'),
-                          ],
-                        ),
+            const SizedBox(height: 12),
+            DropdownButtonFormField<String>(
+              initialValue: _uiCategory,
+              decoration: const InputDecoration(
+                labelText: 'Category',
+                border: OutlineInputBorder(),
+                prefixIcon: Icon(Icons.category),
+              ),
+              items: _uiCategories
+                  .map((c) => DropdownMenuItem(value: c, child: Text(c)))
+                  .toList(),
+              onChanged: (v) => setState(() => _uiCategory = v!),
+            ),
+            const SizedBox(height: 12),
+            TextFormField(
+              controller: _descriptionController,
+              decoration: const InputDecoration(
+                labelText: 'Short description * (max 200 chars)',
+                border: OutlineInputBorder(),
+                alignLabelWithHint: true,
+                helperText: 'Required — what do you see?',
+              ),
+              maxLines: 3,
+              maxLength: 200,
+              validator: (v) {
+                if (v == null || v.trim().isEmpty) {
+                  return 'Description is required';
+                }
+                if (v.trim().length > 200) {
+                  return 'Max 200 characters';
+                }
+                return null;
+              },
+            ),
+            const SizedBox(height: 8),
+            // Optional photo.
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('Photo (optional)',
+                        style: TextStyle(fontWeight: FontWeight.w600)),
+                    const SizedBox(height: 8),
+                    if (_photo != null)
+                      Stack(
+                        children: [
+                          ClipRRect(
+                            borderRadius: BorderRadius.circular(8),
+                            child: Image.file(
+                              File(_photo!.path),
+                              height: 160,
+                              width: double.infinity,
+                              fit: BoxFit.cover,
+                            ),
+                          ),
+                          Positioned(
+                            right: 4,
+                            top: 4,
+                            child: IconButton(
+                              icon: const Icon(Icons.close,
+                                  color: Colors.white),
+                              style: IconButton.styleFrom(
+                                  backgroundColor: Colors.black54),
+                              onPressed: () =>
+                                  setState(() => _photo = null),
+                            ),
+                          ),
+                        ],
                       )
-                    : RefreshIndicator(
-                        onRefresh: _loadComplaints,
-                        child: ListView.builder(
-                          padding: const EdgeInsets.all(16),
-                          itemCount: _complaints.length,
-                          itemBuilder: (context, index) {
-                            final c = _complaints[index];
-                            return Card(
-                              child: ListTile(
-                                leading: Icon(
-                                  _getStatusIcon(c.status),
-                                  color: _getStatusColor(c.status),
-                                ),
-                                title: Text(c.location),
-                                subtitle: Text(
-                                  '${c.category} • ${c.description}',
-                                  maxLines: 2,
-                                  overflow: TextOverflow.ellipsis,
-                                ),
-                                trailing: Chip(
-                                  label: Text(c.status.toUpperCase()),
-                                  backgroundColor:
-                                      _getStatusColor(c.status).withValues(alpha: 0.1),
-                                  labelStyle: TextStyle(
-                                    fontSize: 10,
-                                    color: _getStatusColor(c.status),
-                                  ),
-                                ),
-                              ),
-                            );
-                          },
+                    else
+                      const Text('No photo attached.',
+                          style: TextStyle(color: Colors.grey)),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: OutlinedButton.icon(
+                            onPressed: _submitting
+                                ? null
+                                : () => _pickPhoto(ImageSource.camera),
+                            icon: const Icon(Icons.camera_alt),
+                            label: const Text('Camera'),
+                          ),
                         ),
-                      ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: OutlinedButton.icon(
+                            onPressed: _submitting
+                                ? null
+                                : () => _pickPhoto(ImageSource.gallery),
+                            icon: const Icon(Icons.photo),
+                            label: const Text('Gallery'),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+            FilledButton.icon(
+              onPressed: _submitting ? null : _submitReport,
+              icon: _submitting
+                  ? const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.send),
+              label: Text(_submitting ? 'Submitting...' : 'Submit Report'),
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              '⚠️ Demo complaint system (SQLite backend). Photo is kept on-device; text + location are uploaded.',
+              style: TextStyle(fontSize: 12, color: Colors.grey),
+            ),
           ],
         ),
       ),
     );
   }
 
-  IconData _getStatusIcon(String status) {
-    switch (status) {
-      case 'resolved':
-        return Icons.check_circle;
-      case 'in_progress':
-        return Icons.hourglass_empty;
-      default:
-        return Icons.pending;
+  Widget _buildList() {
+    if (_loadingComplaints) {
+      return const Center(child: CircularProgressIndicator());
     }
+    if (_listError != null && _complaints.isEmpty) {
+      return ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          ConnectionFailedBanner(
+            message: _listError!,
+            onRetryNow: _loadComplaints,
+          ),
+          const SizedBox(height: 16),
+          ErrorState(
+            title: 'Could not load reports',
+            message: '$_listError\n(Fetch failure — not an empty list.)',
+            icon: Icons.cloud_off,
+            onRetry: _loadComplaints,
+          ),
+        ],
+      );
+    }
+    if (_complaints.isEmpty) {
+      return const Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.inbox, size: 64, color: Colors.grey),
+            SizedBox(height: 16),
+            Text('No reports submitted yet'),
+          ],
+        ),
+      );
+    }
+    return RefreshIndicator(
+      onRefresh: _loadComplaints,
+      child: ListView.builder(
+        padding: const EdgeInsets.all(16),
+        itemCount: _complaints.length + (_listError != null ? 1 : 0),
+        itemBuilder: (context, index) {
+          if (_listError != null && index == 0) {
+            return Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: ConnectionFailedBanner(
+                message: 'Refresh failed: $_listError (showing cached list)',
+                onRetryNow: _loadComplaints,
+              ),
+            );
+          }
+          final c = _complaints[_listError != null ? index - 1 : index];
+          final photoPath =
+              c.id != null ? _localPhotoPaths[c.id!] : null;
+          return Card(
+            child: ListTile(
+              leading: photoPath != null
+                  ? ClipRRect(
+                      borderRadius: BorderRadius.circular(8),
+                      child: Image.file(
+                        File(photoPath),
+                        width: 44,
+                        height: 44,
+                        fit: BoxFit.cover,
+                      ),
+                    )
+                  : Icon(_categoryIcon(c.category),
+                      color: _getStatusColor(c.status)),
+              title: Text(
+                c.description,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+              subtitle: Text(
+                '${c.category} • ${_distanceLabel(c)} • ${_timeAgo(c.createdAt)}\n${c.location}',
+                maxLines: 3,
+                overflow: TextOverflow.ellipsis,
+              ),
+              isThreeLine: true,
+              trailing: Chip(
+                label: Text(c.status.toUpperCase()),
+                backgroundColor:
+                    _getStatusColor(c.status).withValues(alpha: 0.1),
+                labelStyle: TextStyle(
+                  fontSize: 10,
+                  color: _getStatusColor(c.status),
+                ),
+              ),
+              onTap: () {
+                Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (_) => ReportDetailScreen(
+                      complaint: c,
+                      distanceLabel: _distanceLabel(c),
+                      timeAgo: _timeAgo(c.createdAt),
+                      localPhotoPath: photoPath,
+                    ),
+                  ),
+                );
+              },
+            ),
+          );
+        },
+      ),
+    );
   }
 
   Color _getStatusColor(String status) {

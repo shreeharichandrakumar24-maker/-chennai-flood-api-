@@ -1,5 +1,8 @@
 import 'package:flutter/material.dart';
+import '../models/prediction_model.dart';
+import '../services/api_exception.dart';
 import '../services/api_service.dart';
+import '../widgets/error_state.dart';
 
 class PredictionHistoryScreen extends StatefulWidget {
   const PredictionHistoryScreen({super.key});
@@ -11,6 +14,7 @@ class PredictionHistoryScreen extends StatefulWidget {
 class _PredictionHistoryScreenState extends State<PredictionHistoryScreen> {
   List<Map<String, dynamic>> _history = [];
   bool _loading = true;
+  String? _fetchError;
 
   @override
   void initState() {
@@ -19,12 +23,35 @@ class _PredictionHistoryScreenState extends State<PredictionHistoryScreen> {
   }
 
   Future<void> _loadHistory() async {
-    setState(() => _loading = true);
-    final history = await ApiService.fetchPredictionHistory();
-    setState(() {
-      _history = history;
-      _loading = false;
-    });
+    if (mounted) {
+      setState(() {
+        _loading = true;
+        _fetchError = null;
+      });
+    }
+    try {
+      final history = await ApiService.withRetry(
+        () => ApiService.fetchPredictionHistory(),
+        label: 'prediction/history',
+      );
+      if (!mounted) return;
+      setState(() {
+        _history = history;
+        _loading = false;
+      });
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _fetchError = e.message;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _fetchError = e.toString();
+      });
+    }
   }
 
   @override
@@ -41,7 +68,25 @@ class _PredictionHistoryScreenState extends State<PredictionHistoryScreen> {
       ),
       body: _loading
           ? const Center(child: CircularProgressIndicator())
-          : _history.isEmpty
+          : _fetchError != null && _history.isEmpty
+              ? ListView(
+                  padding: const EdgeInsets.all(16),
+                  children: [
+                    ConnectionFailedBanner(
+                      message: _fetchError!,
+                      onRetryNow: _loadHistory,
+                    ),
+                    const SizedBox(height: 16),
+                    ErrorState(
+                      title: 'Connection failed',
+                      message:
+                          '${_fetchError!}\n(This is a fetch failure, not "no predictions yet".)',
+                      icon: Icons.cloud_off,
+                      onRetry: _loadHistory,
+                    ),
+                  ],
+                )
+              : _history.isEmpty
               ? Center(
                   child: Column(
                     mainAxisAlignment: MainAxisAlignment.center,
@@ -75,13 +120,17 @@ class _PredictionHistoryScreenState extends State<PredictionHistoryScreen> {
   }
 
   Widget _buildHistoryCard(Map<String, dynamic> pred) {
-    final rfRisk = pred['rf_risk'] ?? 'LOW';
-    final rfScore = (pred['rf_score'] ?? 0).toDouble();
-    final lstmRisk = pred['lstm_risk'];
-    final lstmScore = pred['lstm_score'] != null
-        ? (pred['lstm_score']).toDouble()
+    // P3: use the robust history parser (flat rf_score/lstm_score keys) so
+    // scores never silently become 0.000 via the wrong key path.
+    final rf = ModelResult.fromHistory(pred, isLstm: false);
+    final rfRisk = rf.risk;
+    final rfScore = rf.score;
+    final hasLstm = pred['lstm_risk'] != null;
+    final lstmRisk = hasLstm ? (pred['lstm_risk']?.toString() ?? 'LOW') : null;
+    final lstmScore = hasLstm
+        ? ModelResult.fromHistory(pred, isLstm: true).score
         : null;
-    final generatedAt = pred['generated_at'] ?? '';
+    final generatedAt = pred['generated_at']?.toString() ?? '';
 
     return Card(
       margin: const EdgeInsets.only(bottom: 12),

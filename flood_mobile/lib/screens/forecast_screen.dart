@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
+import '../services/api_exception.dart';
 import '../services/api_service.dart';
 import '../models/prediction_model.dart';
+import '../widgets/error_state.dart';
 
 class ForecastScreen extends StatefulWidget {
   const ForecastScreen({super.key});
@@ -12,6 +14,10 @@ class ForecastScreen extends StatefulWidget {
 class _ForecastScreenState extends State<ForecastScreen> {
   WeatherResponse? _weather;
   bool _loading = true;
+  String? _fetchError;
+  bool _isRetrying = false;
+  int _retryAttempt = 0;
+  bool _isDirectFallback = false;
 
   @override
   void initState() {
@@ -20,12 +26,62 @@ class _ForecastScreenState extends State<ForecastScreen> {
   }
 
   Future<void> _loadWeather() async {
-    setState(() => _loading = true);
-    final weather = await ApiService.fetchWeather();
-    setState(() {
-      _weather = weather;
-      _loading = false;
-    });
+    if (mounted) {
+      setState(() {
+        _loading = _weather == null;
+        _isRetrying = _weather != null;
+        _retryAttempt = 1;
+        _fetchError = null;
+        _isDirectFallback = false;
+      });
+    }
+    try {
+      final weather = await ApiService.withRetry(
+        () => ApiService.fetchWeather(),
+        label: 'forecast/weather',
+        onAttempt: (a) {
+          if (mounted) setState(() => _retryAttempt = a);
+        },
+      );
+      if (!mounted) return;
+      setState(() {
+        _weather = weather;
+        _loading = false;
+        _isRetrying = false;
+        _fetchError = null;
+        _isDirectFallback = false;
+      });
+    } catch (_) {
+      // Backend unreachable (local down / Render asleep): fall back to
+      // live Open-Meteo direct so weather still works.
+      try {
+        final direct = await ApiService.fetchDirectWeather();
+        if (!mounted) return;
+        setState(() {
+          _weather = direct;
+          _loading = false;
+          _isRetrying = false;
+          _fetchError = null;
+          _isDirectFallback = true;
+        });
+      } on ApiException catch (e) {
+        if (!mounted) return;
+        setState(() {
+          _loading = false;
+          _isRetrying = false;
+          _fetchError = e.message;
+          _isDirectFallback = false;
+        });
+      } catch (e) {
+        if (!mounted) return;
+        setState(() {
+          _loading = false;
+          _isRetrying = false;
+          _fetchError = e.toString();
+          _isDirectFallback = false;
+        });
+      }
+    }
   }
 
   @override
@@ -43,35 +99,69 @@ class _ForecastScreenState extends State<ForecastScreen> {
       body: _loading
           ? const Center(child: CircularProgressIndicator())
           : _weather == null
-              ? const Center(
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Icon(Icons.cloud_off, size: 64, color: Colors.grey),
-                      SizedBox(height: 16),
-                      Text('Weather data unavailable'),
-                      Text('Check your internet connection'),
-                    ],
-                  ),
+              ? ListView(
+                  padding: const EdgeInsets.all(16),
+                  children: [
+                    if (_isRetrying)
+                      ConnectionRetryingBanner(
+                        attempt: _retryAttempt,
+                        onRetryNow: _loadWeather,
+                      )
+                    else
+                      ConnectionFailedBanner(
+                        message: _fetchError ?? 'Weather data unavailable',
+                        onRetryNow: _loadWeather,
+                      ),
+                    const SizedBox(height: 16),
+                    ErrorState(
+                      title: _fetchError != null
+                          ? 'Connection failed'
+                          : 'Weather data unavailable',
+                      message:
+                          '${_fetchError ?? 'Check your internet connection'}\n(No cached forecast — this is a fetch failure, not empty data.)',
+                      icon: Icons.cloud_off,
+                      onRetry: _loadWeather,
+                    ),
+                  ],
                 )
               : RefreshIndicator(
                   onRefresh: _loadWeather,
                   child: ListView(
                     padding: const EdgeInsets.all(16),
                     children: [
+                      if (_fetchError != null) ...[
+                        ConnectionFailedBanner(
+                          message: _fetchError!,
+                          onRetryNow: _loadWeather,
+                        ),
+                        const SizedBox(height: 12),
+                      ],
                       // Source Info
                       Card(
-                        color: Colors.blue[50],
+                        color: _isDirectFallback
+                            ? Colors.green[50]
+                            : Colors.blue[50],
                         child: Padding(
                           padding: const EdgeInsets.all(12),
                           child: Row(
                             children: [
-                              const Icon(Icons.info_outline, color: Colors.blue),
+                              Icon(
+                                  _isDirectFallback
+                                      ? Icons.bolt
+                                      : Icons.info_outline,
+                                  color: _isDirectFallback
+                                      ? Colors.green
+                                      : Colors.blue),
                               const SizedBox(width: 8),
                               Expanded(
                                 child: Text(
-                                  'Data from Open-Meteo API (free, no key required)',
-                                  style: TextStyle(color: Colors.blue[700]),
+                                  _isDirectFallback
+                                      ? 'Live weather direct from Open-Meteo (backend unreachable — predictions need backend, weather does not). Pull to retry backend.'
+                                      : 'Data from Open-Meteo API via backend (free, no key required)',
+                                  style: TextStyle(
+                                      color: _isDirectFallback
+                                          ? Colors.green[800]
+                                          : Colors.blue[700]),
                                 ),
                               ),
                             ],

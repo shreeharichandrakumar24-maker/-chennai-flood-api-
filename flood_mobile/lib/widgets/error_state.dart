@@ -97,3 +97,149 @@ class ConnectionStatusBanner extends StatelessWidget {
     );
   }
 }
+
+/// Distinct "Connection failed — retrying..." banner, separate from
+/// "no data yet". Never reuse the empty state for a fetch failure.
+class ConnectionRetryingBanner extends StatelessWidget {
+  final int attempt;
+  final VoidCallback? onRetryNow;
+
+  const ConnectionRetryingBanner({
+    super.key,
+    required this.attempt,
+    this.onRetryNow,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      decoration: BoxDecoration(
+        color: Colors.orange.shade100,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.orange.shade300),
+      ),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 18,
+            height: 18,
+            child: CircularProgressIndicator(
+              strokeWidth: 2,
+              color: Colors.orange.shade800,
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              'Connection failed — retrying... (attempt $attempt/3)',
+              style: TextStyle(
+                color: Colors.orange.shade900,
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+          if (onRetryNow != null)
+            TextButton(
+              onPressed: onRetryNow,
+              child: Text(
+                'Retry now',
+                style: TextStyle(
+                  color: Colors.orange.shade900,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Distinct hard-failure banner with manual "Retry now".
+class ConnectionFailedBanner extends StatelessWidget {
+  final String message;
+  final VoidCallback? onRetryNow;
+
+  const ConnectionFailedBanner({
+    super.key,
+    required this.message,
+    this.onRetryNow,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      decoration: BoxDecoration(
+        color: Colors.red.shade50,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.red.shade300),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.cloud_off, size: 18, color: Colors.red.shade700),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              'Connection failed: $message',
+              style: TextStyle(
+                color: Colors.red.shade900,
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+          if (onRetryNow != null)
+            FilledButton(
+              onPressed: onRetryNow,
+              style: FilledButton.styleFrom(
+                backgroundColor: Colors.red,
+                minimumSize: const Size(0, 36),
+              ),
+              child: const Text('Retry now'),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// "Last known data — X minutes ago, not live" label for cached fallback.
+class StaleDataBanner extends StatelessWidget {
+  final String label;
+
+  const StaleDataBanner({super.key, required this.label});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      decoration: BoxDecoration(
+        color: Colors.blueGrey.shade50,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.blueGrey.shade200),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.history, size: 18, color: Colors.blueGrey.shade700),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              label,
+              style: TextStyle(
+                color: Colors.blueGrey.shade800,
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}

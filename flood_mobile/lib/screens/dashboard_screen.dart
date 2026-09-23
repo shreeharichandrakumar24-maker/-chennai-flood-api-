@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import '../config/api_config.dart';
+import '../services/api_exception.dart';
 import '../services/api_service.dart';
+import '../services/cache_service.dart';
 import '../models/prediction_model.dart';
 import '../widgets/risk_badge.dart';
 import '../widgets/weather_card.dart';
@@ -24,6 +26,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
   Map<String, dynamic>? _status;
   bool _loading = true;
   bool _isConnected = true;
+  String _baseUrlForDisplay = '';
+  // P2: distinct connection-failure state (never conflated with "no data yet")
+  bool _isRetrying = false;
+  int _retryAttempt = 0;
+  String? _fetchError;
+  bool _hasEverLoaded = false;
+  bool _isStale = false;
+  String _staleLabel = '';
   Timer? _autoRefreshTimer;
   int _countdown = 300; // 5 minutes
 
@@ -61,21 +71,117 @@ class _DashboardScreenState extends State<DashboardScreen> {
   }
 
   Future<void> _loadData() async {
-    setState(() => _loading = true);
-    final results = await Future.wait([
-      ApiService.fetchWeather(),
-      ApiService.fetchPrediction(),
-      ApiService.fetchStatus(),
-    ]);
+    final bool firstLoad = !_hasEverLoaded && _prediction == null;
     if (mounted) {
       setState(() {
-        _weather = results[0] as WeatherResponse?;
-        _prediction = results[1] as PredictionResponse?;
-        _status = results[2] as Map<String, dynamic>?;
-        _isConnected = results[2] != null;
-        _loading = false;
+        if (firstLoad) {
+          _loading = true;
+        } else {
+          _isRetrying = true;
+          _retryAttempt = 1;
+        }
+        _fetchError = null;
       });
     }
+    try {
+      final results = await ApiService.withRetry(
+        () => Future.wait([
+          ApiService.fetchWeather(),
+          ApiService.fetchPrediction(),
+          ApiService.fetchStatus(),
+          ApiConfig.getBaseUrl(),
+        ]),
+        label: 'dashboard',
+        onAttempt: (attempt) {
+          if (mounted && !firstLoad) {
+            setState(() {
+              _isRetrying = true;
+              _retryAttempt = attempt;
+            });
+          }
+        },
+      );
+      if (mounted) {
+        setState(() {
+          _weather = results[0] as WeatherResponse;
+          _prediction = results[1] as PredictionResponse;
+          _status = results[2] as Map<String, dynamic>;
+          _baseUrlForDisplay = results[3] as String;
+          _isConnected = true;
+          _loading = false;
+          _isRetrying = false;
+          _retryAttempt = 0;
+          _fetchError = null;
+          _hasEverLoaded = true;
+          _isStale = false;
+          _staleLabel = '';
+        });
+      }
+    } on ApiException catch (e) {
+      // Fetch failed — try cached last-known data, never fake-empty zeros.
+      final cachedPred = await CacheService.loadPrediction();
+      final cachedWeather = await CacheService.loadWeather();
+      final cachedStatus = await CacheService.loadStatus();
+      final baseUrl = await ApiConfig.getBaseUrl();
+      if (!mounted) return;
+      if (cachedPred != null) {
+        setState(() {
+          try {
+            _prediction = PredictionResponse.fromJson(cachedPred.json);
+          } catch (_) {
+            // Keep existing prediction if cache corrupt; do not zero it.
+          }
+          if (cachedWeather != null) {
+            try {
+              _weather = WeatherResponse.fromJson(cachedWeather.json);
+            } catch (_) {}
+          }
+          if (cachedStatus != null) {
+            _status = cachedStatus.json;
+          }
+          _baseUrlForDisplay = baseUrl;
+          _isConnected = false;
+          _loading = false;
+          _isRetrying = false;
+          _hasEverLoaded = true;
+          _isStale = true;
+          _staleLabel = CacheService.staleLabel(cachedPred.at);
+          _fetchError = e.message;
+        });
+      } else {
+        setState(() {
+          _baseUrlForDisplay = baseUrl;
+          _isConnected = false;
+          _loading = false;
+          _isRetrying = false;
+          _fetchError = e.message;
+          _isStale = false;
+        });
+      }
+    } catch (e) {
+      if (!mounted) return;
+      final baseUrl = await ApiConfig.getBaseUrl();
+      setState(() {
+        _baseUrlForDisplay = baseUrl;
+        _isConnected = false;
+        _loading = false;
+        _isRetrying = false;
+        _fetchError = e.toString();
+      });
+    }
+  }
+
+  void _openSettings() {
+    Navigator.of(context)
+        .push(MaterialPageRoute(builder: (_) => const SettingsScreen()))
+        .then((_) => _loadData());
+  }
+
+  void _openHistory() {
+    Navigator.of(context)
+        .push(
+            MaterialPageRoute(builder: (_) => const PredictionHistoryScreen()))
+        .then((_) => _loadData());
   }
 
   @override
@@ -105,13 +211,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
           PopupMenuButton<String>(
             onSelected: (value) {
               if (value == 'settings') {
-                Navigator.of(context).push(
-                  MaterialPageRoute(builder: (_) => const SettingsScreen()),
-                );
+                _openSettings();
               } else if (value == 'history') {
-                Navigator.of(context).push(
-                  MaterialPageRoute(builder: (_) => const PredictionHistoryScreen()),
-                );
+                _openHistory();
               }
             },
             itemBuilder: (context) => [
@@ -139,14 +241,53 @@ class _DashboardScreenState extends State<DashboardScreen> {
           ),
         ],
       ),
-      body: _loading && _prediction == null
+      body: _loading && _prediction == null && _fetchError == null
           ? const Center(child: CircularProgressIndicator())
-          : RefreshIndicator(
+          : (_fetchError != null && _prediction == null)
+              // DISTINCT failure state: never show fake-empty zeros here.
+              ? ListView(
+                  padding: const EdgeInsets.all(16),
+                  children: [
+                    ConnectionFailedBanner(
+                      message: _fetchError ?? 'Unknown error',
+                      onRetryNow: _loadData,
+                    ),
+                    const SizedBox(height: 16),
+                    ErrorState(
+                      title: 'Could not reach the backend',
+                      message:
+                          'No cached data available yet.\n${_fetchError ?? ''}\n\nBackend: ${_baseUrlForDisplay.isEmpty ? ApiConfig.currentUrl : _baseUrlForDisplay}',
+                      icon: Icons.cloud_off,
+                      onRetry: _loadData,
+                    ),
+                  ],
+                )
+              : RefreshIndicator(
               onRefresh: _loadData,
               child: ListView(
                 padding: const EdgeInsets.all(16),
                 children: [
-                  // Connection Status
+                  // P2: distinct retrying banner (not the same as "no data yet")
+                  if (_isRetrying)
+                    ConnectionRetryingBanner(
+                      attempt: _retryAttempt == 0 ? 1 : _retryAttempt,
+                      onRetryNow: _loadData,
+                    ),
+                  if (_isRetrying) const SizedBox(height: 12),
+                  // P2: hard failure banner with manual "Retry now"
+                  if (_fetchError != null && !_isRetrying)
+                    ConnectionFailedBanner(
+                      message: _fetchError ?? 'Unknown error',
+                      onRetryNow: _loadData,
+                    ),
+                  if (_fetchError != null && !_isRetrying)
+                    const SizedBox(height: 12),
+                  // P2: cached fallback label, never blank/zero fields
+                  if (_isStale)
+                    StaleDataBanner(label: _staleLabel),
+                  if (_isStale) const SizedBox(height: 12),
+                  // Legacy online/offline pill (kept, but no longer the
+                  // only signal — retrying/failed/stale banners sit above)
                   ConnectionStatusBanner(
                     isConnected: _isConnected,
                     onRetry: _loadData,
@@ -293,7 +434,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                               _status?['last_refresh'] ?? 'Never'),
                           _detailRow('Next Auto-Refresh', _countdownText),
                           _detailRow('Connected via',
-                              ApiConfig.isPublicUrl ? '🌐 Public (ngrok)' : '📶 Local WiFi'),
+                              _baseUrlForDisplay.isEmpty ? ApiConfig.connectionLabel : '${ApiConfig.isPublicUrl ? '🌐 Public' : '📶 Local'} ($_baseUrlForDisplay)'),
                         ],
                       ),
                     ),
@@ -319,11 +460,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                 child: _actionChip(
                                   Icons.history,
                                   'History',
-                                  () => Navigator.of(context).push(
-                                    MaterialPageRoute(
-                                      builder: (_) => const PredictionHistoryScreen(),
-                                    ),
-                                  ),
+                                  _openHistory,
                                 ),
                               ),
                               const SizedBox(width: 8),
@@ -331,11 +468,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                 child: _actionChip(
                                   Icons.settings,
                                   'Settings',
-                                  () => Navigator.of(context).push(
-                                    MaterialPageRoute(
-                                      builder: (_) => const SettingsScreen(),
-                                    ),
-                                  ),
+                                  _openSettings,
                                 ),
                               ),
                             ],

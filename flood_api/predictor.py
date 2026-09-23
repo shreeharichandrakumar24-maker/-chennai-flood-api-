@@ -71,6 +71,21 @@ def reservoir_baseline() -> dict:
     }
 
 
+def fallback_history(days: int = 18) -> dict:
+    """Offline rainfall history from the local dataset tail.
+
+    Used when Open-Meteo is unreachable/rate-limited (HTTP 429 on shared
+    cloud IPs). Returns {iso_date: mm} for the last ``days`` dataset days
+    so predictions keep serving (marked stale) instead of hard-503ing.
+    """
+    daily, _ = ld.load_rainfall()
+    tail = daily.sort_values("date").tail(days)
+    return {
+        pd.Timestamp(r["date"]).date().isoformat(): float(r["rainfall_mm"])
+        for _, r in tail.iterrows()
+    }
+
+
 def build_daily_table(history_rain: dict, res: dict) -> pd.DataFrame:
     """Turn the daily precipitation timeline into a per-day feature table."""
     series = pd.Series(history_rain).astype(float)

@@ -14,7 +14,9 @@ DELETE /api/v1/complaints/{id}
 """
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Optional
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -35,17 +37,36 @@ STATE = {
     "weather": None,
     "prediction": None,
     "error": None,
+    "last_attempt": 0.0,
 }
+
+# Minimum seconds between automatic (non-forced) refresh attempts, so
+# repeated app opens / "Retry now" taps don't hammer a rate-limited
+# Open-Meteo endpoint with a fresh call every time.
+REFRESH_COOLDOWN_SECONDS = 60.0
 
 _scheduler = None
 
 
-def do_refresh() -> None:
+def do_refresh(force: bool = False) -> None:
+    """Refresh weather + prediction.
+
+    Live path: Open-Meteo (weather.fetch_weather already retries 429/5xx
+    internally). On persistent failure the last good STATE is kept; if
+    STATE is still empty an offline fallback prediction is built (last
+    saved weather history, else the local rainfall dataset tail) so the
+    API serves stale data with HTTP 200 instead of a permanent 503.
+    """
+    now = time.monotonic()
+    if not force and (now - STATE.get("last_attempt", 0.0)) < REFRESH_COOLDOWN_SECONDS:
+        return
+    STATE["last_attempt"] = now
     try:
         w = weather_mod.fetch_weather()
         pred = predictor.run_prediction(w["history"], w["today_iso"])
         pred["weather"] = w
         pred["generated_at"] = w["fetched_at"]
+        pred["stale"] = False
         STATE["last_refresh"] = w["fetched_at"]
         STATE["weather"] = w
         STATE["prediction"] = pred
@@ -55,6 +76,115 @@ def do_refresh() -> None:
     except Exception as exc:
         STATE["error"] = str(exc)
         log.exception("refresh failed")
+        if STATE.get("prediction") is not None:
+            return  # keep serving the previous good data
+        _resurrect_last_prediction()
+        if STATE.get("prediction") is not None:
+            return
+        _offline_fallback_prediction()
+
+
+def _resurrect_last_prediction() -> None:
+    """Load the most recent SQLite prediction into STATE (marked stale).
+
+    Same-process restarts on ephemeral disks have an empty DB, in which
+    case there is nothing to resurrect and the API correctly stays 503
+    until Open-Meteo answers again.
+    """
+    try:
+        last = store.last_prediction()
+    except Exception:
+        log.exception("stale fallback: could not read predictions table")
+        return
+    if not last:
+        return
+    try:
+        res = predictor.reservoir_baseline()
+    except Exception:
+        res = {"reservoir_total_mcft": 0.0,
+               "reservoir_avg_pct": 0.0, "reservoir_max_pct": 0.0}
+    rf_proba = {}
+    for k in ("LOW", "MODERATE", "HIGH"):
+        rf_proba[k] = 1.0 if last.get("rf_risk") == k else 0.0
+    pred = {
+        "features": last.get("features") or {},
+        "reservoir": res,
+        "random_forest": {
+            "risk": last.get("rf_risk") or "LOW",
+            "probabilities": rf_proba,
+            "score": last.get("rf_score") if last.get("rf_score") is not None else 0.0,
+        },
+        "lstm": ({"risk": last.get("lstm_risk"), "score": last.get("lstm_score")}
+                 if last.get("lstm_risk") else None),
+        "lstm_available": predictor.lstm_available(),
+        "generated_at": last.get("generated_at"),
+        "stale": True,
+        "weather": last.get("weather") or {},
+    }
+    STATE["prediction"] = pred
+    STATE["weather"] = last.get("weather") or {}
+    STATE["last_refresh"] = last.get("generated_at")
+    log.info("Serving stale prediction from %s", last.get("generated_at"))
+
+
+def _offline_fallback_prediction() -> None:
+    """Build a stale prediction with zero network access.
+
+    Tries, in order: (1) the weather history embedded in the most recent
+    saved prediction (fresh if < 48h old), else (2) the local rainfall
+    dataset tail. Reservoir always comes from the offline baseline, so
+    this path only needs the ML model files — never Open-Meteo.
+    """
+    history = None
+    source = "offline-dataset-tail"
+    try:
+        last = store.last_prediction()
+        w = (last or {}).get("weather") or {}
+        hist = w.get("history") if isinstance(w, dict) else None
+        if isinstance(hist, dict) and len(hist) >= 14:
+            try:
+                newest = max(hist.keys())
+                age_h = (datetime.now(timezone.utc) -
+                         datetime.fromisoformat(newest)).total_seconds() / 3600.0
+            except Exception:
+                age_h = 1e9
+            if age_h < 48:
+                history = {k: float(v) for k, v in hist.items()}
+                source = "last-saved-weather"
+    except Exception:
+        log.exception("offline fallback: could not reuse saved weather")
+    if history is None:
+        try:
+            history = predictor.fallback_history()
+        except Exception:
+            log.exception("offline fallback: dataset tail failed")
+            return
+    try:
+        today_iso = datetime.now(timezone.utc).date().isoformat()
+        pred = predictor.run_prediction(history, today_iso)
+        generated_at = datetime.now(timezone.utc).isoformat()
+        pred["weather"] = {
+            "source": source,
+            "fetched_at": generated_at,
+            "today_iso": today_iso,
+            "current": None,
+            "history": history,
+            "forecast": [],
+            "note": ("Open-Meteo unreachable (rate-limited); "
+                     "prediction built from offline rainfall data."),
+        }
+        pred["generated_at"] = generated_at
+        pred["stale"] = True
+        STATE["last_refresh"] = generated_at
+        STATE["weather"] = pred["weather"]
+        STATE["prediction"] = pred
+        try:
+            store.save_prediction(pred)
+        except Exception:
+            log.exception("offline fallback: could not persist prediction")
+        log.info("Serving OFFLINE fallback prediction (source=%s)", source)
+    except Exception:
+        log.exception("offline fallback: run_prediction failed")
 
 
 @asynccontextmanager
@@ -140,7 +270,7 @@ def get_prediction():
 
 @app.post("/api/v1/prediction/refresh")
 def refresh_prediction():
-    do_refresh()
+    do_refresh(force=True)
     if STATE["prediction"] is None:
         raise HTTPException(503, "Prediction unavailable: " + str(STATE["error"]))
     return {"refreshed_at": STATE["last_refresh"], "prediction": STATE["prediction"]}

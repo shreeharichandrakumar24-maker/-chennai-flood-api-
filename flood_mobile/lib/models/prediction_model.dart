@@ -1,3 +1,54 @@
+import 'package:flutter/foundation.dart';
+
+/// Parse any JSON numeric into double WITHOUT silently swallowing errors.
+/// Logs the actual problem via debugPrint instead of substituting 0.
+double _parseDouble(dynamic value, String field, String context) {
+  if (value == null) {
+    debugPrint(
+        '[ModelParse] $context: field "$field" is MISSING (null) — check raw JSON key names (score vs rf_score vs riskScore, case/nesting). Using 0.0 as last resort.');
+    return 0.0;
+  }
+  if (value is double) return value;
+  if (value is int) return value.toDouble();
+  if (value is num) return value.toDouble();
+  if (value is String) {
+    final parsed = double.tryParse(value);
+    if (parsed != null) return parsed;
+    debugPrint(
+        '[ModelParse] $context: field "$field" string "$value" is not numeric. Using 0.0.');
+    return 0.0;
+  }
+  debugPrint(
+      '[ModelParse] $context: field "$field" has unexpected type ${value.runtimeType} ($value). Using 0.0.');
+  return 0.0;
+}
+
+/// Look up the score under every known key variant so a backend key rename
+/// (score / rf_score / riskScore / risk_score) can never silently become 0.
+double _extractScore(Map<String, dynamic> json, String context) {
+  const candidates = [
+    'score',
+    'rf_score',
+    'lstm_score',
+    'risk_score',
+    'riskScore',
+    'risk_score_value',
+    'probability',
+  ];
+  for (final key in candidates) {
+    if (json.containsKey(key) && json[key] != null) {
+      if (key != 'score') {
+        debugPrint(
+            '[ModelParse] $context: using alternate key "$key" (expected "score"). Raw: $json');
+      }
+      return _parseDouble(json[key], key, context);
+    }
+  }
+  debugPrint(
+      '[ModelParse] $context: NO score key found. Keys present: ${json.keys.toList()}. Full raw: $json');
+  return 0.0;
+}
+
 class PredictionResponse {
   final Map<String, dynamic>? features;
   final Map<String, dynamic>? reservoir;
@@ -16,13 +67,41 @@ class PredictionResponse {
   });
 
   factory PredictionResponse.fromJson(Map<String, dynamic> json) {
+    // P3 step 1: log the RAW JSON right before parsing, in full.
+    debugPrint('[ModelParse] RAW PredictionResponse JSON: $json');
+    // P3 step 2: compare exact key names — backend sends snake_case
+    // "random_forest" / "lstm_available" / "generated_at". Log if absent.
+    for (final k in ['random_forest', 'lstm', 'lstm_available', 'generated_at']) {
+      if (!json.containsKey(k)) {
+        debugPrint('[ModelParse] PredictionResponse: expected key "$k" '
+            'NOT FOUND. Present keys: ${json.keys.toList()}');
+      }
+    }
     return PredictionResponse(
-      features: json['features'],
-      reservoir: json['reservoir'],
-      randomForest: ModelResult.fromJson(json['random_forest'] ?? {}),
-      lstm: json['lstm'] != null ? ModelResult.fromJson(json['lstm']) : null,
+      features: json['features'] is Map
+          ? Map<String, dynamic>.from(json['features'] as Map)
+          : null,
+      reservoir: json['reservoir'] is Map
+          ? Map<String, dynamic>.from(json['reservoir'] as Map)
+          : null,
+      randomForest: json['random_forest'] is Map
+          ? ModelResult.fromJson(
+              Map<String, dynamic>.from(json['random_forest'] as Map),
+              context: 'random_forest',
+            )
+          : (() {
+              debugPrint(
+                  '[ModelParse] random_forest object missing — check nesting. Raw: $json');
+              return ModelResult(risk: 'LOW', score: 0.0);
+            })(),
+      lstm: json['lstm'] is Map
+          ? ModelResult.fromJson(
+              Map<String, dynamic>.from(json['lstm'] as Map),
+              context: 'lstm',
+            )
+          : null,
       lstmAvailable: json['lstm_available'] ?? false,
-      generatedAt: json['generated_at'],
+      generatedAt: json['generated_at']?.toString(),
     );
   }
 
@@ -45,13 +124,51 @@ class ModelResult {
     this.probabilities,
   });
 
-  factory ModelResult.fromJson(Map<String, dynamic> json) {
+  factory ModelResult.fromJson(Map<String, dynamic> json,
+      {String context = 'ModelResult'}) {
+    // P3 step 1: full raw log before parsing.
+    debugPrint('[ModelParse] RAW $context JSON: $json');
+    final risk = (json['risk'] ?? json['Risk'] ?? 'LOW').toString();
+    if (!json.containsKey('risk')) {
+      debugPrint('[ModelParse] $context: "risk" key missing '
+          '(case-sensitive check). Keys: ${json.keys.toList()}');
+    }
+    // P3 steps 2-4: multi-key lookup + logged parse (no silent ?? 0.0).
+    final score = _extractScore(json, context);
+    Map<String, double>? probs;
+    final rawProbs = json['probabilities'] ?? json['probs'];
+    if (rawProbs is Map) {
+      probs = {};
+      for (final e in rawProbs.entries) {
+        probs[e.key.toString()] =
+            _parseDouble(e.value, 'probabilities[${e.key}]', context);
+      }
+    }
+    // P3 step 5: callers format with toStringAsFixed(3) — never hardcode.
+    debugPrint('[ModelParse] $context parsed => risk=$risk '
+        'score=${score.toStringAsFixed(3)}');
     return ModelResult(
-      risk: json['risk'] ?? 'LOW',
-      score: (json['score'] ?? 0.0).toDouble(),
-      probabilities: json['probabilities'] != null
-          ? Map<String, double>.from(json['probabilities'])
-          : null,
+      risk: risk,
+      score: score,
+      probabilities: probs,
+    );
+  }
+
+  /// Parse a flat history row ({rf_score, rf_risk, ...}) into a ModelResult.
+  /// History endpoint uses different keys than live prediction — this was a
+  /// likely 0.000 source when the wrong parser was applied.
+  factory ModelResult.fromHistory(Map<String, dynamic> json,
+      {bool isLstm = false}) {
+    debugPrint('[ModelParse] RAW history JSON: $json');
+    if (isLstm) {
+      return ModelResult(
+        risk: (json['lstm_risk'] ?? 'LOW').toString(),
+        score: _parseDouble(json['lstm_score'], 'lstm_score', 'history(lstm)'),
+      );
+    }
+    return ModelResult(
+      risk: (json['rf_risk'] ?? 'LOW').toString(),
+      score: _parseDouble(json['rf_score'], 'rf_score', 'history(rf)'),
     );
   }
 }
@@ -107,13 +224,16 @@ class CurrentWeather {
 
   factory CurrentWeather.fromJson(Map<String, dynamic> json) {
     return CurrentWeather(
-      tempC: (json['temp_c'] ?? 0).toDouble(),
-      feelsLikeC: (json['feels_like_c'] ?? 0).toDouble(),
-      humidityPct: json['humidity_pct'] ?? 0,
-      precipMm: (json['precip_mm'] ?? 0).toDouble(),
-      windKmh: (json['wind_kmh'] ?? 0).toDouble(),
-      description: json['description'] ?? 'Unknown',
-      icon: json['icon'] ?? 'unknown',
+      tempC: _parseDouble(json['temp_c'], 'temp_c', 'CurrentWeather'),
+      feelsLikeC:
+          _parseDouble(json['feels_like_c'], 'feels_like_c', 'CurrentWeather'),
+      humidityPct: (json['humidity_pct'] is num)
+          ? (json['humidity_pct'] as num).toInt()
+          : int.tryParse('${json['humidity_pct']}') ?? 0,
+      precipMm: _parseDouble(json['precip_mm'], 'precip_mm', 'CurrentWeather'),
+      windKmh: _parseDouble(json['wind_kmh'], 'wind_kmh', 'CurrentWeather'),
+      description: json['description']?.toString() ?? 'Unknown',
+      icon: json['icon']?.toString() ?? 'unknown',
     );
   }
 }

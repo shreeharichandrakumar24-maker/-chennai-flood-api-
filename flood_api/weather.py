@@ -5,12 +5,25 @@ Open-Meteo endpoints used:
 """
 from datetime import date, datetime, timezone
 
+import logging
+import time
+
 import requests
+
+log = logging.getLogger("flood-api")
 
 CHENNAI = {"latitude": 13.0827, "longitude": 80.2707}
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 PAST_DAYS = 18      # enough to build the 14-day rolling windows used by the models
 FORECAST_DAYS = 3
+
+# Open-Meteo asks API consumers to identify themselves; shared datacenter IPs
+# (e.g. Render free tier) get rate-limited (HTTP 429) otherwise.
+HEADERS = {"User-Agent": "ChennaiFloodApp/1.0 (college-project; contact: admin@example.com)"}
+
+# Retry policy for transient Open-Meteo failures (429 rate limit / 5xx).
+_MAX_ATTEMPTS = 3
+_BACKOFF_SECONDS = (5, 20)
 
 WMO_CODES = {
     0: ("Clear sky", "clear"), 1: ("Mainly clear", "clear"),
@@ -36,7 +49,12 @@ def _describe(code):
 
 
 def fetch_weather() -> dict:
-    """Fetch current conditions and a daily precipitation timeline."""
+    """Fetch current conditions and a daily precipitation timeline.
+
+    Retries transient failures (HTTP 429 rate limit — common on shared
+    cloud IPs — and 5xx) with backoff, honoring the server's Retry-After
+    header when present. Raises the last error if all attempts fail.
+    """
     params = {
         "latitude": CHENNAI["latitude"],
         "longitude": CHENNAI["longitude"],
@@ -47,8 +65,42 @@ def fetch_weather() -> dict:
         "forecast_days": FORECAST_DAYS,
         "timezone": "Asia/Kolkata",
     }
-    resp = requests.get(FORECAST_URL, params=params, timeout=25)
-    resp.raise_for_status()
+    last_exc = None
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        try:
+            resp = requests.get(FORECAST_URL, params=params,
+                                headers=HEADERS, timeout=25)
+            if resp.status_code == 429 or 500 <= resp.status_code < 600:
+                retry_after = resp.headers.get("Retry-After")
+                try:
+                    wait = int(float(retry_after)) if retry_after else None
+                except (TypeError, ValueError):
+                    wait = None
+                if wait is None and attempt <= len(_BACKOFF_SECONDS):
+                    wait = _BACKOFF_SECONDS[attempt - 1]
+                log.warning("Open-Meteo HTTP %s (attempt %d/%d); %s",
+                            resp.status_code, attempt, _MAX_ATTEMPTS,
+                            f"retrying in {wait}s" if wait else "giving up")
+                if wait is not None and attempt < _MAX_ATTEMPTS:
+                    time.sleep(wait)
+                    continue
+                resp.raise_for_status()
+            resp.raise_for_status()
+            break
+        except requests.HTTPError as exc:
+            last_exc = exc
+            if attempt >= _MAX_ATTEMPTS:
+                raise
+        except requests.RequestException as exc:
+            last_exc = exc
+            log.warning("Open-Meteo request failed (attempt %d/%d): %s",
+                        attempt, _MAX_ATTEMPTS, exc)
+            if attempt >= _MAX_ATTEMPTS:
+                raise
+            if attempt <= len(_BACKOFF_SECONDS):
+                time.sleep(_BACKOFF_SECONDS[attempt - 1])
+    else:
+        raise last_exc  # pragma: no cover - loop always breaks or raises
     data = resp.json()
 
     cur = data["current"]

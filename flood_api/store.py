@@ -52,6 +52,69 @@ def init_db():
     )
     conn.commit()
     conn.close()
+    seed_sample_complaints()
+
+
+def seed_sample_complaints():
+    """Seed 2-3 realistic sample reports so the Report flow demonstrates
+    end-to-end even before real submissions arrive.
+
+    SEED-ONLY helper: does not modify any existing endpoint signatures.
+    Runs on startup via init_db(); inserts only when the table is empty.
+    """
+    conn = _conn()
+    try:
+        count = conn.execute("SELECT COUNT(*) AS c FROM complaints").fetchone()["c"]
+    except Exception:
+        conn.close()
+        return
+    if count and count > 0:
+        conn.close()
+        return
+    samples = [
+        {
+            "name": "Priya R.",
+            "phone": "98400-12345",
+            "location": "T. Nagar, G N Chetty Rd (near bus depot)",
+            "lat": 13.0410,
+            "lon": 80.2340,
+            "category": "Waterlogging",
+            "description": "Knee-deep waterlogging after overnight rain; two-wheelers stalled.",
+            "status": "submitted",
+        },
+        {
+            "name": "Karthik S.",
+            "phone": None,
+            "location": "Velachery 100 Feet Rd, opp. bus stand",
+            "lat": 12.9815,
+            "lon": 80.2180,
+            "category": "Road closure",
+            "description": "Blocked road: fallen branch + waterlogging, one lane closed.",
+            "status": "in_progress",
+        },
+        {
+            "name": "Deepa M.",
+            "phone": "98410-67890",
+            "location": "Adyar, LB Rd near signal",
+            "lat": 13.0062,
+            "lon": 80.2574,
+            "category": "Drainage blocked",
+            "description": "Storm drain blocked with debris; water entering footpath shops.",
+            "status": "submitted",
+        },
+    ]
+    ts = now_iso()
+    for s in samples:
+        conn.execute(
+            """INSERT INTO complaints
+               (name, phone, location, lat, lon, category, description, status,
+                created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (s["name"], s["phone"], s["location"], s["lat"], s["lon"],
+             s["category"], s["description"], s["status"], ts, ts),
+        )
+    conn.commit()
+    conn.close()
 
 
 # ---------------- Complaints ----------------

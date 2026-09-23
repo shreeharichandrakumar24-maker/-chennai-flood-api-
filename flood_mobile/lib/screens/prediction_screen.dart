@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
+import '../services/api_exception.dart';
 import '../services/api_service.dart';
 import '../models/prediction_model.dart';
+import '../widgets/error_state.dart';
 
 class PredictionScreen extends StatefulWidget {
   const PredictionScreen({super.key});
@@ -14,17 +16,51 @@ class _PredictionScreenState extends State<PredictionScreen> {
   double _reservoirPct = 70.0;
   PredictionResponse? _prediction;
   bool _loading = false;
+  String? _fetchError;
+  bool _isRetrying = false;
+  int _retryAttempt = 0;
 
   Future<void> _getPrediction() async {
-    setState(() => _loading = true);
+    if (mounted) {
+      setState(() {
+        _loading = true;
+        _isRetrying = true;
+        _retryAttempt = 1;
+        _fetchError = null;
+      });
+    }
 
-    // Force refresh with current conditions
-    final result = await ApiService.refreshPrediction();
-
-    setState(() {
-      _prediction = result;
-      _loading = false;
-    });
+    try {
+      // Force refresh with current conditions (3 attempts, 2s/5s/10s)
+      final result = await ApiService.withRetry(
+        () => ApiService.refreshPrediction(),
+        label: 'predict/refresh',
+        onAttempt: (a) {
+          if (mounted) setState(() => _retryAttempt = a);
+        },
+      );
+      if (!mounted) return;
+      setState(() {
+        _prediction = result;
+        _loading = false;
+        _isRetrying = false;
+        _fetchError = null;
+      });
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _isRetrying = false;
+        _fetchError = e.message;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _isRetrying = false;
+        _fetchError = e.toString();
+      });
+    }
   }
 
   @override
@@ -96,6 +132,20 @@ class _PredictionScreenState extends State<PredictionScreen> {
           ),
 
           const SizedBox(height: 16),
+
+          // P2: distinct error / retrying states (never blank)
+          if (_isRetrying && _loading)
+            ConnectionRetryingBanner(
+              attempt: _retryAttempt,
+              onRetryNow: _getPrediction,
+            ),
+          if (_fetchError != null && !_loading) ...[
+            ConnectionFailedBanner(
+              message: _fetchError!,
+              onRetryNow: _getPrediction,
+            ),
+            const SizedBox(height: 12),
+          ],
 
           // Results Section
           if (_prediction != null) ...[

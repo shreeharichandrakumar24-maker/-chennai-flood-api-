@@ -23,6 +23,9 @@ dependencies:
   # Location
   geolocator: ^13.0.1
 
+  # Photo upload (P4 citizen reporting)
+  image_picker: ^1.0.8
+
   # Local storage
   shared_preferences: ^2.3.0
 

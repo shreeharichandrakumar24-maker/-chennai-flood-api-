@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../config/api_config.dart';
+import '../services/api_exception.dart';
 import '../services/api_service.dart';
 
 class SettingsScreen extends StatefulWidget {
@@ -13,6 +14,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   final _urlController = TextEditingController();
   bool _testing = false;
   bool? _connectionOk;
+  String _lastTestResult = '';
   Map<String, dynamic>? _status;
   bool _loading = true;
 
@@ -34,36 +36,84 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Future<void> _loadStatus() async {
-    final status = await ApiService.fetchStatus();
-    if (mounted) {
-      setState(() => _status = status);
+    try {
+      final status = await ApiService.fetchStatus();
+      if (mounted) {
+        setState(() => _status = status);
+      }
+    } on ApiException catch (_) {
+      if (mounted) {
+        setState(() => _status = null);
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(() => _status = null);
+      }
     }
   }
 
   Future<void> _testConnection() async {
+    final candidate = _urlController.text.trim();
+    final isPublic = candidate.contains('onrender') ||
+        candidate.contains('ngrok') ||
+        candidate.contains('railway') ||
+        candidate.contains('duckdns.org') ||
+        candidate.contains('trycloudflare.com');
     setState(() {
       _testing = true;
       _connectionOk = null;
     });
+    if (isPublic && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+              '⏳ Public server (Render free tier) can take 30–60s to wake up. Testing…'),
+          duration: Duration(seconds: 4),
+        ),
+      );
+    }
 
-    await ApiConfig.setBaseUrl(_urlController.text.trim());
-    final status = await ApiService.fetchStatus();
+    // Test WITHOUT saving: a failed Render wake-up must not clobber the
+    // last working URL.
+    String result = 'fail';
+    Map<String, dynamic>? status;
+    try {
+      result = await ApiConfig.testCandidate(candidate);
+      if (result != 'fail') {
+        await ApiConfig.setBaseUrl(candidate);
+        try {
+          status = await ApiService.fetchStatus();
+        } catch (_) {
+          status = null;
+        }
+      }
+    } catch (_) {
+      result = 'fail';
+    }
 
     setState(() {
       _testing = false;
-      _connectionOk = status != null;
-      _status = status;
+      _connectionOk = result == 'ok' ? true : (result == 'fail' ? false : null);
+      _lastTestResult = result;
+      if (status != null) _status = status;
     });
 
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            _connectionOk == true
-                ? '✅ Connected successfully!'
-                : '❌ Could not connect to server',
+            result == 'ok'
+                ? '✅ Connected successfully — predictions available!'
+                : result == 'degraded'
+                    ? '⚠️ Server reachable but NOT serving predictions yet (starting / rate-limited). URL saved — try Dashboard again in a bit.'
+                    : isPublic
+                        ? '❌ No response yet — Render may still be waking (wait ~60s and tap Test again). Kept your previous URL.'
+                        : '❌ Could not connect to server. Kept your previous URL.',
           ),
-          backgroundColor: _connectionOk == true ? Colors.green : Colors.red,
+          backgroundColor: result == 'ok'
+              ? Colors.green
+              : (result == 'degraded' ? Colors.orange : Colors.red),
+          duration: const Duration(seconds: 5),
         ),
       );
     }
@@ -148,7 +198,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         child: Text(
                           _connectionOk == true
                               ? 'Connected to: ${ApiConfig.baseUrl}'
-                              : 'Not connected. Set up below.',
+                              : (_lastTestResult == 'degraded'
+                                  ? 'Server reachable but degraded — predictions not ready yet.'
+                                  : 'Not connected. Set up below.'),
                           style: TextStyle(
                             fontWeight: FontWeight.w600,
                             color: _connectionOk == true
@@ -253,8 +305,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             borderRadius: BorderRadius.circular(8),
                             border: Border.all(color: Colors.purple.shade200),
                           ),
-                          child: const Text(
-                            'Cloud URL: https://chennai-flood-api.onrender.com\n'
+                          child: Text(
+                            'Cloud URL: ${ApiConfig.defaultUrl}\n'
                             'Auto-connected if default URL is set.',
                             style: TextStyle(
                               fontFamily: 'monospace',
