@@ -679,8 +679,8 @@ class _ReportScreenState extends State<ReportScreen>
             const SizedBox(height: 8),
             Text(
               PhotoService.isAvailable
-                  ? '☁️ Photos upload to Firebase Storage; report text + location go to the Render backend.'
-                  : '⚠️ Firebase photo upload is not configured on this build — reports submit as text-only.',
+                  ? '☁️ Photos upload to Cloudinary; report text + location go to the Render backend.'
+                  : '⚠️ Photo upload is unavailable on this build — reports submit as text-only.',
               style: const TextStyle(fontSize: 12, color: Colors.grey),
             ),
           ],

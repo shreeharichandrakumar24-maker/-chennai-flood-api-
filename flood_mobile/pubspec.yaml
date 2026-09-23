@@ -26,9 +26,7 @@ dependencies:
   # Photo upload (P4 citizen reporting)
   image_picker: ^1.0.8
 
-  # Firebase — photo storage only (Render keeps all report data)
-  firebase_core: ^3.8.0
-  firebase_storage: ^12.3.0
+  # Cloudinary unsigned uploads — no SDK, plain HTTPS (see photo_service.dart)
 
   # Local storage
   shared_preferences: ^2.3.0

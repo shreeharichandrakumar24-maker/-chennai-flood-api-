@@ -1,9 +1,8 @@
+import 'dart:convert';
 import 'dart:io';
-import 'dart:math';
 
-import 'package:firebase_core/firebase_core.dart';
-import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/foundation.dart';
+import 'package:http/http.dart' as http;
 
 class PhotoUploadException implements Exception {
   final String message;
@@ -13,100 +12,100 @@ class PhotoUploadException implements Exception {
   String toString() => 'PhotoUploadException: $message';
 }
 
-/// Firebase Storage uploads — photos only (all report data stays on the
-/// Render backend). Uploads never throw raw Firebase errors; failures come
-/// back as [PhotoUploadException] with a human-readable message, and the
-/// text report is always submitted FIRST so a photo failure can never lose
-/// or block a report.
+/// Cloudinary unsigned uploads — photos only (all report data stays on the
+/// Render backend). No API secret in the app: the `flood_reports` preset is
+/// Unsigned, so uploads need only the cloud name + preset name.
+///
+/// Uploads never throw raw transport errors; failures come back as
+/// [PhotoUploadException] with a human-readable message, and the text
+/// report is always submitted FIRST so a photo failure can never lose or
+/// block a report.
 class PhotoService {
-  /// False when Firebase isn't configured on this build (missing
-  /// google-services.json) — the UI then hides photo upload gracefully
-  /// instead of crashing.
-  static bool get isAvailable {
-    try {
-      return Firebase.apps.isNotEmpty;
-    } catch (_) {
-      return false;
-    }
-  }
+  // Cloudinary account (free tier, no card). The `flood_reports` upload
+  // preset must exist as Unsigned with asset folder `flood_reports`.
+  static const String _cloudName = 'bg9apdxe';
+  static const String _uploadPreset = 'flood_reports';
+  static const int _maxBytes = 5 * 1024 * 1024;
 
-  /// Upload a report photo and return its public download URL.
-  /// Storage path: `reports/{reportId}/{timestamp}-{rand}.jpg`.
-  /// Respects the 5 MB Storage rule by rejecting oversized files up front.
+  /// No SDK setup needed — plain HTTPS. Always available.
+  static bool get isAvailable => true;
+
+  /// Upload a report photo and return its public `secure_url`.
+  /// Storage path: `<preset asset folder>/<timestamp>-<rand>.<ext>`.
   static Future<String> uploadReportPhoto({
     required int reportId,
     required String localPath,
     void Function(double progress)? onProgress,
   }) async {
-    if (!isAvailable) {
-      throw const PhotoUploadException(
-          'Photo upload is not configured on this build');
-    }
     final file = File(localPath);
     if (!await file.exists()) {
       throw const PhotoUploadException('Photo file not found on device');
     }
     final bytes = await file.length();
-    if (bytes > 5 * 1024 * 1024) {
+    if (bytes > _maxBytes) {
       throw const PhotoUploadException(
           'Photo is larger than 5 MB — pick a smaller image');
     }
     final ext = localPath.split('.').last.toLowerCase();
     final safeExt =
         ['jpg', 'jpeg', 'png', 'webp'].contains(ext) ? ext : 'jpg';
-    final rand = Random().nextInt(1 << 30).toRadixString(36);
-    final name = '${DateTime.now().millisecondsSinceEpoch}-$rand.$safeExt';
-    final ref =
-        FirebaseStorage.instance.ref().child('reports/$reportId/$name');
+    final rand =
+        DateTime.now().millisecondsSinceEpoch.toRadixString(36);
+    final filename = 'report-$reportId-$rand.$safeExt';
+    final uri = Uri.parse(
+        'https://api.cloudinary.com/v1_1/$_cloudName/image/upload');
+
+    http.StreamedResponse resp;
     try {
-      final task = ref.putFile(
-        file,
-        SettableMetadata(contentType: 'image/${safeExt == 'jpg' ? 'jpeg' : safeExt}'),
-      );
-      task.snapshotEvents.listen((snap) {
-        if (snap.totalBytes > 0) {
-          onProgress?.call(snap.bytesTransferred / snap.totalBytes);
-        }
-      });
-      await task;
-      final url = await ref.getDownloadURL();
-      debugPrint('[PhotoService] uploaded reports/$reportId/$name');
+      onProgress?.call(0.2);
+      final req = http.MultipartRequest('POST', uri)
+        ..fields['upload_preset'] = _uploadPreset
+        ..files.add(await http.MultipartFile.fromPath(
+          'file',
+          localPath,
+          filename: filename,
+        ));
+      resp = await req.send().timeout(const Duration(seconds: 60));
+    } on Exception catch (e) {
+      debugPrint('[PhotoService] upload transport failed: $e');
+      throw PhotoUploadException(
+          'Photo upload failed — check internet and retry ($e)');
+    }
+    final body = await resp.stream.bytesToString();
+    if (resp.statusCode != 200) {
+      debugPrint(
+          '[PhotoService] Cloudinary HTTP ${resp.statusCode}: $body');
+      throw PhotoUploadException(_friendlyHttpError(resp.statusCode, body));
+    }
+    try {
+      final json = jsonDecode(body) as Map<String, dynamic>;
+      final url = json['secure_url']?.toString();
+      if (url == null || url.isEmpty) {
+        throw const PhotoUploadException(
+            'Photo upload gave no URL — retry (preset may be Signed or missing)');
+      }
+      onProgress?.call(1.0);
+      debugPrint('[PhotoService] uploaded $filename');
       return url;
-    } on FirebaseException catch (e) {
-      debugPrint('[PhotoService] upload failed: ${e.code} ${e.message}');
-      throw PhotoUploadException(_friendlyMessage(e));
     } catch (e) {
-      debugPrint('[PhotoService] upload failed: $e');
-      throw PhotoUploadException('Photo upload failed: $e');
+      if (e is PhotoUploadException) rethrow;
+      debugPrint('[PhotoService] bad Cloudinary response: $body');
+      throw PhotoUploadException('Photo upload gave an unreadable reply');
     }
   }
 
-  static String _friendlyMessage(FirebaseException e) {
-    switch (e.code) {
-      case 'object-not-found':
-        // Upload "succeeded" locally but the object isn't in the bucket.
-        // In practice this means the bucket isn't provisioned or the app
-        // is pointed at the wrong one — a console setup issue, not a
-        // network issue, so say so explicitly.
-        return 'Firebase Storage rejected the file (object-not-found). '
-            'Check in Firebase console: 1) Storage → "Get started" clicked '
-            '(bucket must exist), 2) Rules allow write to /reports/**, '
-            '3) Rules are Published, not just typed.';
-      case 'bucket-not-found':
-        return 'Firebase Storage bucket not found — finish Storage setup '
-            '(Get started) in the Firebase console for project '
-            'chennai-flood-app.';
-      case 'unauthorized':
-        return 'Photo upload blocked by Storage rules (unauthorized) — '
-            'allow write to /reports/** in the Firebase console Rules tab '
-            'and Publish.';
-      case 'retry-limit-exceeded':
-      case 'unavailable':
-        return 'Photo upload failed — network unavailable, will retry';
-      case 'canceled':
-        return 'Photo upload was canceled';
-      default:
-        return 'Photo upload failed (${e.code})${e.message != null ? ': ${e.message}' : ''}';
+  static String _friendlyHttpError(int status, String body) {
+    if (status == 400 && body.contains('preset')) {
+      return 'Photo upload rejected — upload preset "flood_reports" is '
+          'missing or not Unsigned in the Cloudinary console';
     }
+    if (status == 401 || status == 403) {
+      return 'Photo upload rejected by Cloudinary (HTTP $status) — '
+          'check the upload preset is Unsigned';
+    }
+    if (status == 429) {
+      return 'Photo service is busy (rate-limited) — wait a minute and retry';
+    }
+    return 'Photo upload failed (HTTP $status) — retry';
   }
 }
