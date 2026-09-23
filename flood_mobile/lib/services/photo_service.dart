@@ -83,8 +83,23 @@ class PhotoService {
 
   static String _friendlyMessage(FirebaseException e) {
     switch (e.code) {
+      case 'object-not-found':
+        // Upload "succeeded" locally but the object isn't in the bucket.
+        // In practice this means the bucket isn't provisioned or the app
+        // is pointed at the wrong one — a console setup issue, not a
+        // network issue, so say so explicitly.
+        return 'Firebase Storage rejected the file (object-not-found). '
+            'Check in Firebase console: 1) Storage → "Get started" clicked '
+            '(bucket must exist), 2) Rules allow write to /reports/**, '
+            '3) Rules are Published, not just typed.';
+      case 'bucket-not-found':
+        return 'Firebase Storage bucket not found — finish Storage setup '
+            '(Get started) in the Firebase console for project '
+            'chennai-flood-app.';
       case 'unauthorized':
-        return 'Photo upload blocked by Storage rules (unauthorized)';
+        return 'Photo upload blocked by Storage rules (unauthorized) — '
+            'allow write to /reports/** in the Firebase console Rules tab '
+            'and Publish.';
       case 'retry-limit-exceeded':
       case 'unavailable':
         return 'Photo upload failed — network unavailable, will retry';
